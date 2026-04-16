@@ -4,6 +4,7 @@ const state = {
   model: null,
   originalModel: null,
   packageConfigOrder: [],
+  embeddedAssetLinks: {},
   previewUrl: null,
   previewTimer: null,
   lastPreviewAt: "",
@@ -280,6 +281,7 @@ async function loadFile(file) {
     state.model = parsed.model;
     state.originalModel = deepClone(parsed.model);
     state.packageConfigOrder = parsed.packageConfigOrder;
+    state.embeddedAssetLinks = parsed.embeddedAssetLinks;
     state.status = {
       kind: "ready",
       message:
@@ -291,6 +293,7 @@ async function loadFile(file) {
     clearPreview();
     state.model = null;
     state.originalModel = null;
+    state.embeddedAssetLinks = {};
     state.status = {
       kind: "error",
       message: error instanceof Error ? error.message : String(error),
@@ -336,6 +339,7 @@ function parseLunaExport(html) {
   const preloaderIcon = html.match(preloaderIconPattern)?.[2] ?? "";
 
   return {
+    embeddedAssetLinks: collectEmbeddedAssetLinks(html),
     packageConfigOrder: Object.keys(packageConfig),
     model: {
       packageConfig,
@@ -661,7 +665,13 @@ function renderAssetsSection() {
           filtered.length
             ? filtered
                 .map(
-                  ([assetId, value]) => `
+                  ([assetId, value]) => {
+                    const linkedAssets = state.embeddedAssetLinks[assetId] || [];
+                    const linkedSummary = linkedAssets.length
+                      ? `Patches ${linkedAssets.length} embedded bundle asset${linkedAssets.length === 1 ? "" : "s"} in this export.`
+                      : "No embedded bundle asset match was found in this export, so only the Luna override metadata will change.";
+
+                    return `
                     <article class="field-card">
                       <div class="field-card__header">
                         <h4 class="field-title">Asset ${escapeHtml(assetId)}</h4>
@@ -692,8 +702,10 @@ function renderAssetsSection() {
                           ${renderImagePreview(value, `Asset ${assetId}`)}
                         </div>
                       </div>
+                      <div class="field-summary">${escapeHtml(linkedSummary)}</div>
                     </article>
-                  `
+                  `;
+                  }
                 )
                 .join("")
             : `
@@ -1721,6 +1733,7 @@ function buildPatchedHtml() {
     preloaderIconPattern,
     `$1${escapeAttribute(state.model.preloader.icon)}$3`
   );
+  html = patchEmbeddedAssetSources(html);
   return html;
 }
 
@@ -1763,12 +1776,90 @@ function serializeJsLiteral(value) {
   return '""';
 }
 
+function patchEmbeddedAssetSources(html) {
+  if (!state.model || !state.originalModel) {
+    return html;
+  }
+
+  for (const [assetId, replacement] of Object.entries(
+    state.model.playgroundAssetOverrides
+  )) {
+    const linkedAssets = state.embeddedAssetLinks[assetId];
+    const originalValue = state.originalModel.playgroundAssetOverrides?.[assetId];
+
+    if (
+      !linkedAssets?.length ||
+      JSON.stringify(replacement) === JSON.stringify(originalValue) ||
+      typeof replacement !== "string" ||
+      !replacement
+    ) {
+      continue;
+    }
+
+    for (const embeddedAssetId of linkedAssets) {
+      html = replaceEmbeddedAssetSource(html, embeddedAssetId, replacement);
+    }
+  }
+
+  return html;
+}
+
+function replaceEmbeddedAssetSource(html, embeddedAssetId, replacementUrl) {
+  const pattern = new RegExp(
+    `<(?:img|video|audio|source)\\b[^>]*\\bid="${escapeRegExp(
+      embeddedAssetId
+    )}"[^>]*>`,
+    "i"
+  );
+
+  if (!pattern.test(html)) {
+    return html;
+  }
+
+  pattern.lastIndex = 0;
+  return html.replace(pattern, (tag) =>
+    buildReplacementAssetTag(tag, replacementUrl)
+  );
+}
+
+function buildReplacementAssetTag(originalTag, replacementUrl) {
+  const template = document.createElement("template");
+  template.innerHTML = originalTag.trim();
+  const element = template.content.firstElementChild;
+
+  if (!element) {
+    return originalTag;
+  }
+
+  element.removeAttribute("data-src122");
+  element.removeAttribute("data-src");
+  element.removeAttribute("data-mime");
+  element.setAttribute("src", replacementUrl);
+  return element.outerHTML;
+}
+
 function replaceOnce(source, pattern, replacement) {
   if (!pattern.test(source)) {
     throw new Error("A required Luna block could not be found while rebuilding the file.");
   }
   pattern.lastIndex = 0;
   return source.replace(pattern, replacement);
+}
+
+function collectEmbeddedAssetLinks(html) {
+  const links = {};
+  const pattern =
+    /<(?:img|video|audio|source)\b[^>]*\bid="(assets\/[^"]*\/(\d+)\.[^"]+)"[^>]*>/g;
+
+  let match;
+  while ((match = pattern.exec(html))) {
+    const fullAssetId = match[1];
+    const assetId = match[2];
+    links[assetId] ||= [];
+    links[assetId].push(fullAssetId);
+  }
+
+  return links;
 }
 
 function getFieldValue(groupName, fieldName) {
@@ -2087,6 +2178,10 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value).replace(/`/g, "&#96;");
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function decodeHtml(value) {
