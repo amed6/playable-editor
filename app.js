@@ -5,8 +5,11 @@ const state = {
   originalModel: null,
   packageConfigOrder: [],
   embeddedAssetLinks: {},
+  assetPreviewSources: {},
   previewUrl: null,
   previewTimer: null,
+  previewAssetPollTimer: null,
+  previewGeneration: 0,
   lastPreviewAt: "",
   previewViewport: "auto",
   previewPointerId: null,
@@ -242,6 +245,7 @@ function bindEvents() {
   elements.editorSections.addEventListener("input", handleEditorInput);
   elements.editorSections.addEventListener("change", handleEditorChange);
   elements.editorSections.addEventListener("click", handleEditorClick);
+  elements.previewFrame.addEventListener("load", handlePreviewFrameLoad);
   document.addEventListener("click", handleViewportClick);
   elements.previewInputOverlay.addEventListener(
     "pointerdown",
@@ -276,6 +280,7 @@ async function loadFile(file) {
   try {
     const html = await file.text();
     const parsed = parseLunaExport(html);
+    revokeAssetPreviewSources();
     state.originalHtml = html;
     state.filename = file.name;
     state.model = parsed.model;
@@ -399,7 +404,7 @@ function renderMetrics() {
 
   const groups = Object.keys(state.model.playgroundOverrides).length;
   const fields = getAllFieldEntries(state.model.playgroundOverrides).length;
-  const assets = Object.keys(state.model.playgroundAssetOverrides).length;
+  const assets = getEditableAssetEntries().length;
   const changes = getChangeCount();
   elements.metricGroups.textContent = String(groups);
   elements.metricFields.textContent = String(fields);
@@ -634,13 +639,15 @@ function renderPreloaderSection() {
 }
 
 function renderAssetsSection() {
-  const assetEntries = Object.entries(state.model.playgroundAssetOverrides);
+  const assetEntries = getEditableAssetEntries();
   const search = state.search;
-  const filtered = assetEntries.filter(([assetId, value]) => {
+  const filtered = assetEntries.filter((entry) => {
     if (!search) {
       return true;
     }
-    return `${assetId} ${value}`.toLowerCase().includes(search);
+    return `${entry.assetId} ${entry.value} ${entry.mediaType} ${entry.references
+      .map((reference) => reference.id)
+      .join(" ")}`.toLowerCase().includes(search);
   });
 
   if (!filtered.length && search) {
@@ -655,7 +662,7 @@ function renderAssetsSection() {
         <div class="section-title">
           <div>
             <h3>Asset Overrides</h3>
-            <div class="section-meta">Editable URLs or uploaded replacements for Luna assets</div>
+            <div class="section-meta">Editable URLs or uploaded replacements for Luna images, videos, and audio clips</div>
           </div>
         </div>
         <span class="field-badge">${assetEntries.length} assets</span>
@@ -665,44 +672,52 @@ function renderAssetsSection() {
           filtered.length
             ? filtered
                 .map(
-                  ([assetId, value]) => {
-                    const linkedAssets = state.embeddedAssetLinks[assetId] || [];
-                    const linkedSummary = linkedAssets.length
-                      ? `Patches ${linkedAssets.length} embedded bundle asset${linkedAssets.length === 1 ? "" : "s"} in this export.`
-                      : "No embedded bundle asset match was found in this export, so only the Luna override metadata will change.";
+                  (entry) => {
+                    const linkedSummary = describeAssetLinkSummary(entry.references);
+                    const embeddedSource = entry.references[0]?.id;
 
                     return `
                     <article class="field-card">
                       <div class="field-card__header">
-                        <h4 class="field-title">Asset ${escapeHtml(assetId)}</h4>
-                        <span class="field-badge">asset</span>
+                        <h4 class="field-title">Asset ${escapeHtml(entry.assetId)}</h4>
+                        <span class="field-badge">${escapeHtml(entry.mediaType)}</span>
                       </div>
                       <div class="field-inline field-inline--asset">
                         <div class="field-inline field-inline--stack">
                           <label class="mini-label">
-                            <span>Source URL or Data URL</span>
+                            <span>Replacement URL or Data URL</span>
                             <input
                               type="text"
-                              value="${escapeAttribute(value)}"
+                              value="${escapeAttribute(entry.value)}"
+                              placeholder="${escapeAttribute(embeddedSource || "")}"
                               data-action="asset-text"
-                              data-asset-id="${escapeAttribute(assetId)}"
+                              data-asset-id="${escapeAttribute(entry.assetId)}"
                             />
                           </label>
                           <label class="button button--ghost file-button">
                             <input
                               type="file"
-                              accept="image/*,video/*"
+                              accept="image/*,video/*,audio/*"
                               data-action="asset-upload"
-                              data-asset-id="${escapeAttribute(assetId)}"
+                              data-asset-id="${escapeAttribute(entry.assetId)}"
                             />
                             <span>Upload Replacement Asset</span>
                           </label>
                         </div>
                         <div class="asset-preview">
-                          ${renderImagePreview(value, `Asset ${assetId}`)}
+                          ${renderAssetPreview(
+                            getAssetPreviewValue(entry),
+                            `Asset ${entry.assetId}`,
+                            entry.mediaType
+                          )}
                         </div>
                       </div>
                       <div class="field-summary">${escapeHtml(linkedSummary)}</div>
+                      ${
+                        embeddedSource
+                          ? `<div class="field-summary">Embedded source: ${escapeHtml(embeddedSource)}</div>`
+                          : ""
+                      }
                     </article>
                   `;
                   }
@@ -711,7 +726,7 @@ function renderAssetsSection() {
             : `
               <div class="empty-state">
                 <h2>No asset overrides</h2>
-                <p>This export does not include editable Luna asset overrides.</p>
+                <p>This export does not include editable Luna image, video, or audio bundle assets.</p>
               </div>
             `
         }
@@ -1059,7 +1074,7 @@ function handleEditorInput(event) {
       onModelUpdated();
       return;
     case "asset-text":
-      state.model.playgroundAssetOverrides[target.dataset.assetId] = target.value;
+      setAssetOverrideValue(target.dataset.assetId, target.value);
       onModelUpdated();
       return;
     case "field-scalar":
@@ -1124,7 +1139,7 @@ function handleEditorChange(event) {
     case "asset-upload":
       readFileAsDataUrl(target.files?.[0]).then((result) => {
         if (result) {
-          state.model.playgroundAssetOverrides[target.dataset.assetId] = result;
+          setAssetOverrideValue(target.dataset.assetId, result);
           onModelUpdated(true);
         }
       });
@@ -1519,6 +1534,7 @@ function updateStatusBanner() {
 
 function schedulePreviewRefresh(immediate = false) {
   clearTimeout(state.previewTimer);
+  clearTimeout(state.previewAssetPollTimer);
   elements.previewStatus.textContent = "Refreshing…";
   state.previewTimer = window.setTimeout(
     () => {
@@ -1526,6 +1542,7 @@ function schedulePreviewRefresh(immediate = false) {
         const html = buildPatchedHtml();
         const previewHtml = buildPreviewHtml(html);
         state.lastPatchedHtml = html;
+        state.previewGeneration += 1;
         const url = URL.createObjectURL(new Blob([previewHtml], { type: "text/html" }));
         const oldUrl = state.previewUrl;
         state.previewUrl = url;
@@ -1589,14 +1606,163 @@ function renderPreviewViewportControls() {
 }
 
 function clearPreview() {
+  clearTimeout(state.previewAssetPollTimer);
   if (state.previewUrl) {
     URL.revokeObjectURL(state.previewUrl);
   }
+  revokeAssetPreviewSources();
   state.previewUrl = null;
   elements.previewFrame.removeAttribute("src");
   elements.previewInputOverlay.hidden = true;
   updatePreviewState();
   elements.previewStatus.textContent = "Idle";
+}
+
+function handlePreviewFrameLoad() {
+  if (!state.model || !state.previewUrl) {
+    return;
+  }
+
+  syncAudioPreviewSources(state.previewGeneration);
+}
+
+function syncAudioPreviewSources(generation, attempt = 0) {
+  clearTimeout(state.previewAssetPollTimer);
+
+  if (generation !== state.previewGeneration || !state.model) {
+    return;
+  }
+
+  const audioEntries = getEditableAssetEntries().filter(
+    (entry) =>
+      !entry.value &&
+      entry.mediaType === "audio" &&
+      entry.references.some((reference) => reference.kind === "compressed-sound")
+  );
+
+  if (!audioEntries.length) {
+    return;
+  }
+
+  const frameWindow = elements.previewFrame.contentWindow;
+  const sounds = frameWindow?.sounds;
+  let readyCount = 0;
+  let updated = false;
+
+  for (const entry of audioEntries) {
+    const soundReference = entry.references.find(
+      (reference) => reference.kind === "compressed-sound"
+    );
+    if (!soundReference) {
+      continue;
+    }
+
+    const payload = sounds?.[soundReference.id];
+    if (!payload) {
+      continue;
+    }
+
+    readyCount += 1;
+    updated =
+      storeAssetPreviewSource(entry.assetId, payload, soundReference.id, generation) ||
+      updated;
+  }
+
+  if (updated) {
+    renderEditor();
+  }
+
+  if (readyCount < audioEntries.length && attempt < 24) {
+    state.previewAssetPollTimer = window.setTimeout(() => {
+      syncAudioPreviewSources(generation, attempt + 1);
+    }, 250);
+  }
+}
+
+function storeAssetPreviewSource(assetId, payload, sourceId, generation) {
+  const existing = state.assetPreviewSources[assetId];
+  if (existing && existing.sourceId === sourceId) {
+    return false;
+  }
+
+  const objectUrl = createAssetPreviewUrl(payload, sourceId);
+  if (!objectUrl) {
+    return false;
+  }
+
+  if (existing?.url) {
+    URL.revokeObjectURL(existing.url);
+  }
+
+  state.assetPreviewSources[assetId] = {
+    url: objectUrl,
+    sourceId,
+    generation,
+  };
+  return true;
+}
+
+function createAssetPreviewUrl(payload, sourceId) {
+  let blob = null;
+
+  if (isBlobLike(payload)) {
+    blob = payload;
+  } else if (isArrayBufferLike(payload)) {
+    blob = new Blob([payload], { type: inferMimeTypeFromAssetId(sourceId) });
+  } else if (ArrayBuffer.isView(payload)) {
+    blob = new Blob(
+      [payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)],
+      { type: inferMimeTypeFromAssetId(sourceId) }
+    );
+  }
+
+  return blob ? URL.createObjectURL(blob) : "";
+}
+
+function revokeAssetPreviewSources() {
+  clearTimeout(state.previewAssetPollTimer);
+  Object.values(state.assetPreviewSources).forEach((entry) => {
+    if (entry?.url) {
+      URL.revokeObjectURL(entry.url);
+    }
+  });
+  state.assetPreviewSources = {};
+}
+
+function inferMimeTypeFromAssetId(assetId) {
+  const lower = assetId.toLowerCase();
+  if (lower.endsWith(".mp3")) {
+    return "audio/mpeg";
+  }
+  if (lower.endsWith(".wav")) {
+    return "audio/wav";
+  }
+  if (lower.endsWith(".ogg")) {
+    return "audio/ogg";
+  }
+  if (lower.endsWith(".m4a")) {
+    return "audio/mp4";
+  }
+  if (lower.endsWith(".aac")) {
+    return "audio/aac";
+  }
+  if (lower.endsWith(".weba") || lower.endsWith(".webm")) {
+    return "audio/webm";
+  }
+  return "application/octet-stream";
+}
+
+function isArrayBufferLike(value) {
+  return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+}
+
+function isBlobLike(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.arrayBuffer === "function" &&
+    typeof value.type === "string"
+  );
 }
 
 function getEffectivePreviewOrientation() {
@@ -1796,18 +1962,22 @@ function patchEmbeddedAssetSources(html) {
       continue;
     }
 
-    for (const embeddedAssetId of linkedAssets) {
-      html = replaceEmbeddedAssetSource(html, embeddedAssetId, replacement);
+    for (const assetReference of linkedAssets) {
+      html = replaceEmbeddedAssetSource(html, assetReference, replacement);
     }
   }
 
   return html;
 }
 
-function replaceEmbeddedAssetSource(html, embeddedAssetId, replacementUrl) {
+function replaceEmbeddedAssetSource(html, assetReference, replacementUrl) {
+  if (assetReference.kind === "compressed-sound") {
+    return replaceCompressedSoundSource(html, assetReference.id, replacementUrl);
+  }
+
   const pattern = new RegExp(
     `<(?:img|video|audio|source)\\b[^>]*\\bid="${escapeRegExp(
-      embeddedAssetId
+      assetReference.id
     )}"[^>]*>`,
     "i"
   );
@@ -1820,6 +1990,29 @@ function replaceEmbeddedAssetSource(html, embeddedAssetId, replacementUrl) {
   return html.replace(pattern, (tag) =>
     buildReplacementAssetTag(tag, replacementUrl)
   );
+}
+
+function replaceCompressedSoundSource(html, embeddedAssetId, replacementUrl) {
+  const pattern =
+    /window\._compressedAssets\.push\(\s*decompressArrayBuffer\([\s\S]*?\)\.then\(\s*function\s*\(\s*sound\s*\)\s*\{\s*window\.sounds\[\s*"([^"]+)"\s*\]\s*=\s*sound\s*;?\s*\}\s*\)\s*\)\s*;?/g;
+
+  let didReplace = false;
+  const patchedHtml = html.replace(pattern, (match, assetId) => {
+    if (assetId !== embeddedAssetId) {
+      return match;
+    }
+
+    didReplace = true;
+    return `${buildReplacementSoundLoader(assetId, replacementUrl)};`;
+  });
+
+  return didReplace ? patchedHtml : html;
+}
+
+function buildReplacementSoundLoader(embeddedAssetId, replacementUrl) {
+  const replacementLiteral = JSON.stringify(replacementUrl);
+  const assetLiteral = JSON.stringify(embeddedAssetId);
+  return `window._compressedAssets.push(fetch(${replacementLiteral}).then(function(response){ if("ok" in response && !response.ok) throw new Error("Failed to load replacement asset: "+response.status); return response.arrayBuffer(); }).then(function(sound){ window.sounds[${assetLiteral}] = sound; }))`;
 }
 
 function buildReplacementAssetTag(originalTag, replacementUrl) {
@@ -1848,18 +2041,154 @@ function replaceOnce(source, pattern, replacement) {
 
 function collectEmbeddedAssetLinks(html) {
   const links = {};
+  collectTaggedEmbeddedAssetLinks(html, links);
+  collectCompressedSoundLinks(html, links);
+
+  return links;
+}
+
+function collectTaggedEmbeddedAssetLinks(html, links) {
   const pattern =
-    /<(?:img|video|audio|source)\b[^>]*\bid="(assets\/[^"]*\/(\d+)\.[^"]+)"[^>]*>/g;
+    /<(img|video|audio|source)\b[^>]*\bid="(assets\/[^"]*\/(\d+)\.[^"]+)"[^>]*>/g;
 
   let match;
   while ((match = pattern.exec(html))) {
-    const fullAssetId = match[1];
-    const assetId = match[2];
-    links[assetId] ||= [];
-    links[assetId].push(fullAssetId);
+    const tagName = match[1].toLowerCase();
+    const fullAssetId = match[2];
+    const assetId = match[3];
+    addEmbeddedAssetLink(links, assetId, {
+      id: fullAssetId,
+      kind: "tag",
+      mediaType: tagName === "source" ? inferMediaTypeFromValue(fullAssetId) : tagName,
+    });
+  }
+}
+
+function collectCompressedSoundLinks(html, links) {
+  const pattern =
+    /window\.sounds\[\s*"(assets\/bundles\/[^"]*\/(\d+)\.(?:mp3|wav|ogg|m4a|aac|weba|webm))"\s*\]\s*=\s*sound/g;
+
+  let match;
+  while ((match = pattern.exec(html))) {
+    addEmbeddedAssetLink(links, match[2], {
+      id: match[1],
+      kind: "compressed-sound",
+      mediaType: "audio",
+    });
+  }
+}
+
+function addEmbeddedAssetLink(links, assetId, reference) {
+  links[assetId] ||= [];
+  if (
+    !links[assetId].some(
+      (existing) => existing.id === reference.id && existing.kind === reference.kind
+    )
+  ) {
+    links[assetId].push(reference);
+  }
+}
+
+function getEditableAssetEntries() {
+  if (!state.model) {
+    return [];
   }
 
-  return links;
+  const assetIds = new Set(Object.keys(state.model.playgroundAssetOverrides));
+
+  for (const [assetId, references] of Object.entries(state.embeddedAssetLinks)) {
+    if (shouldExposeDiscoveredAsset(references)) {
+      assetIds.add(assetId);
+    }
+  }
+
+  return Array.from(assetIds)
+    .sort(compareAssetIds)
+    .map((assetId) => {
+      const references = state.embeddedAssetLinks[assetId] || [];
+      const value = state.model.playgroundAssetOverrides[assetId] ?? "";
+      return {
+        assetId,
+        value,
+        mediaType: inferAssetMediaType(value, references),
+        references,
+      };
+    });
+}
+
+function shouldExposeDiscoveredAsset(references) {
+  return references.some(
+    (reference) => reference.kind === "compressed-sound" || reference.mediaType !== "img"
+  );
+}
+
+function getAssetPreviewValue(entry) {
+  return entry.value || state.assetPreviewSources[entry.assetId]?.url || "";
+}
+
+function compareAssetIds(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+    return leftNumber - rightNumber;
+  }
+  return String(left).localeCompare(String(right), undefined, { numeric: true });
+}
+
+function inferAssetMediaType(value, references) {
+  if (references.some((reference) => reference.mediaType === "audio")) {
+    return "audio";
+  }
+  if (references.some((reference) => reference.mediaType === "video")) {
+    return "video";
+  }
+  if (references.some((reference) => reference.mediaType === "img")) {
+    return "image";
+  }
+
+  return inferMediaTypeFromValue(value);
+}
+
+function inferMediaTypeFromValue(value) {
+  if (looksLikeAudioSource(value)) {
+    return "audio";
+  }
+  if (looksLikeVideoSource(value)) {
+    return "video";
+  }
+  if (looksLikeImageSource(value)) {
+    return "image";
+  }
+  return "asset";
+}
+
+function describeAssetLinkSummary(references) {
+  if (!references.length) {
+    return "No embedded Luna bundle source was found in this export, so only override metadata will change.";
+  }
+
+  const kinds = new Set(references.map((reference) => reference.kind));
+  const sourceKind = kinds.has("compressed-sound")
+    ? "inline compressed audio bundle"
+    : "embedded bundle asset";
+
+  return `Patches ${references.length} ${sourceKind}${references.length === 1 ? "" : "s"} in this export.`;
+}
+
+function setAssetOverrideValue(assetId, value) {
+  const originalOverrides = state.originalModel?.playgroundAssetOverrides || {};
+  const hasOriginal = Object.prototype.hasOwnProperty.call(originalOverrides, assetId);
+
+  if (!value) {
+    if (hasOriginal) {
+      state.model.playgroundAssetOverrides[assetId] = originalOverrides[assetId];
+    } else {
+      delete state.model.playgroundAssetOverrides[assetId];
+    }
+    return;
+  }
+
+  state.model.playgroundAssetOverrides[assetId] = value;
 }
 
 function getFieldValue(groupName, fieldName) {
@@ -1930,26 +2259,82 @@ function getDownloadName(filename) {
   return `${filename}-edited.html`;
 }
 
-function renderImagePreview(src, alt) {
+function renderAssetPreview(src, alt, mediaType = "asset") {
   if (!src) {
-    return `<div class="asset-preview__fallback">No preview</div>`;
-  }
-
-  const lower = src.toLowerCase();
-  const looksLikeImage =
-    lower.startsWith("data:image/") ||
-    /\.(png|jpe?g|gif|webp|svg)(\?|$)/.test(lower);
-
-  if (!looksLikeImage) {
-    return `<div class="asset-preview__fallback">URL</div><div class="field-summary">${escapeHtml(
-      shorten(src, 48)
+    return `<div class="asset-preview__fallback">${escapeHtml(
+      mediaType === "asset" ? "No preview" : mediaType
     )}</div>`;
   }
 
-  return `
-    <img src="${escapeAttribute(src)}" alt="${escapeAttribute(alt)}" />
-    <div class="field-summary">${escapeHtml(shorten(src, 48))}</div>
-  `;
+  const resolvedMediaType =
+    mediaType === "image" || mediaType === "video" || mediaType === "audio"
+      ? mediaType
+      : inferMediaTypeFromValue(src);
+
+  if (resolvedMediaType === "image" || looksLikeImageSource(src)) {
+    return `
+      <img src="${escapeAttribute(src)}" alt="${escapeAttribute(alt)}" />
+      <div class="field-summary">${escapeHtml(shorten(src, 48))}</div>
+    `;
+  }
+
+  if (resolvedMediaType === "video" || looksLikeVideoSource(src)) {
+    return `
+      <video src="${escapeAttribute(src)}" controls muted playsinline preload="metadata"></video>
+      <div class="field-summary">${escapeHtml(shorten(src, 48))}</div>
+    `;
+  }
+
+  if (resolvedMediaType === "audio" || looksLikeAudioSource(src)) {
+    return `
+      <audio src="${escapeAttribute(src)}" controls preload="metadata"></audio>
+      <div class="field-summary">${escapeHtml(shorten(src, 48))}</div>
+    `;
+  }
+
+  return `<div class="asset-preview__fallback">URL</div><div class="field-summary">${escapeHtml(
+    shorten(src, 48)
+  )}</div>`;
+}
+
+function renderImagePreview(src, alt) {
+  return renderAssetPreview(src, alt, "image");
+}
+
+function looksLikeImageSource(value) {
+  if (!value) {
+    return false;
+  }
+
+  const lower = value.toLowerCase();
+  return (
+    lower.startsWith("data:image/") ||
+    /\.(png|jpe?g|gif|webp|svg)(\?|$)/.test(lower)
+  );
+}
+
+function looksLikeVideoSource(value) {
+  if (!value) {
+    return false;
+  }
+
+  const lower = value.toLowerCase();
+  return (
+    lower.startsWith("data:video/") ||
+    /\.(mp4|webm|ogv|mov|m4v)(\?|$)/.test(lower)
+  );
+}
+
+function looksLikeAudioSource(value) {
+  if (!value) {
+    return false;
+  }
+
+  const lower = value.toLowerCase();
+  return (
+    lower.startsWith("data:audio/") ||
+    /\.(mp3|wav|ogg|m4a|aac|weba)(\?|$)/.test(lower)
+  );
 }
 
 function describeArrayField(type, value) {

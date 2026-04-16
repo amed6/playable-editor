@@ -550,6 +550,20 @@ textarea {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.asset-preview video {
+  width: 96px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.asset-preview audio {
+  width: min(220px, 100%);
+  height: 40px;
+}
+
 .asset-preview__fallback {
   display: grid;
   place-items: center;
