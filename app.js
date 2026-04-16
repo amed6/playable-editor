@@ -5,6 +5,9 @@ const state = {
   originalModel: null,
   packageConfigOrder: [],
   embeddedAssetLinks: {},
+  bundleInspection: createEmptyBundleInspection(),
+  meshOverrides: {},
+  meshDonorChoices: {},
   assetPreviewSources: {},
   previewUrl: null,
   previewTimer: null,
@@ -16,6 +19,7 @@ const state = {
   search: "",
   jsonEditor: null,
   lastPatchedHtml: "",
+  loadSequence: 0,
   status: {
     kind: "idle",
     message: "Upload a Luna-downloaded HTML export to begin.",
@@ -34,6 +38,7 @@ const elements = {
   metricGroups: document.getElementById("metricGroups"),
   metricFields: document.getElementById("metricFields"),
   metricAssets: document.getElementById("metricAssets"),
+  metricMeshes: document.getElementById("metricMeshes"),
   metricChanges: document.getElementById("metricChanges"),
   previewFrame: document.getElementById("previewFrame"),
   previewInputOverlay: document.getElementById("previewInputOverlay"),
@@ -65,6 +70,14 @@ const preloaderColorPattern =
   /(id="parameter\/preloader\/color" style="background:)([^"]*)(")/;
 const preloaderIconPattern =
   /(id="asset\/preloader\/icon" src=")([^"]*)(")/;
+const meshOverrideScriptPattern =
+  /<script data-luna-mesh-overrides>[\s\S]*?<\/script>/g;
+const compressedBundleJsonPattern =
+  /decompressString\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*,\s*(true|false|!0|!1)\s*\)\.then\(\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*window\.jsons\[\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*\]\s*=\s*JSON\.parse\(\s*[A-Za-z_$][\w$]*\s*\)\s*;?\s*\}\s*\)\s*;?/g;
+const compressedBundleBlobPattern =
+  /decompressArrayBuffer\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*,\s*(true|false|!0|!1)\s*\)\.then\(\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*window\.blobs\[\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*\]\s*=\s*[A-Za-z_$][\w$]*\s*;?\s*\}\s*\)\s*;?/g;
+const brotliDecoderPattern =
+  /window\.makeBrotliDecodeStr\s*=\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/;
 const previewHelperScript = `<script>
 !function(){
   if(window.__LUNA_EDITOR_PREVIEW_HELPER__)return;
@@ -229,6 +242,8 @@ function bindEvents() {
     }
 
     state.model = deepClone(state.originalModel);
+    state.meshOverrides = {};
+    state.meshDonorChoices = {};
     state.status = {
       kind: "ready",
       message: "Changes reset to the original Luna export values.",
@@ -277,6 +292,8 @@ function bindEvents() {
 }
 
 async function loadFile(file) {
+  const loadSequence = ++state.loadSequence;
+
   try {
     const html = await file.text();
     const parsed = parseLunaExport(html);
@@ -287,6 +304,9 @@ async function loadFile(file) {
     state.originalModel = deepClone(parsed.model);
     state.packageConfigOrder = parsed.packageConfigOrder;
     state.embeddedAssetLinks = parsed.embeddedAssetLinks;
+    state.bundleInspection = createLoadingBundleInspection();
+    state.meshOverrides = {};
+    state.meshDonorChoices = {};
     state.status = {
       kind: "ready",
       message:
@@ -294,11 +314,15 @@ async function loadFile(file) {
     };
     renderApp();
     schedulePreviewRefresh(true);
+    inspectEmbeddedBundles(html, loadSequence);
   } catch (error) {
     clearPreview();
     state.model = null;
     state.originalModel = null;
     state.embeddedAssetLinks = {};
+    state.bundleInspection = createEmptyBundleInspection();
+    state.meshOverrides = {};
+    state.meshDonorChoices = {};
     state.status = {
       kind: "error",
       message: error instanceof Error ? error.message : String(error),
@@ -361,6 +385,38 @@ function parseLunaExport(html) {
   };
 }
 
+async function inspectEmbeddedBundles(html, loadSequence) {
+  try {
+    const inspection = await analyzeMeshBundlesFromHtml(html);
+
+    if (loadSequence !== state.loadSequence || html !== state.originalHtml) {
+      return;
+    }
+
+    state.bundleInspection = inspection;
+    renderApp();
+  } catch (error) {
+    if (loadSequence !== state.loadSequence || html !== state.originalHtml) {
+      return;
+    }
+
+    state.bundleInspection = {
+      status: "error",
+      message:
+        error instanceof Error
+          ? error.message
+          : "The embedded Luna bundle metadata could not be inspected.",
+      bundles: [],
+      meshesById: {},
+      bundleCount: 0,
+      meshBundleCount: 0,
+      meshCount: 0,
+      failedBundles: 0,
+    };
+    renderApp();
+  }
+}
+
 function parsePackageConfig(literal) {
   const normalized = literal
     .replace(/([{,])([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')
@@ -398,6 +454,7 @@ function renderMetrics() {
     elements.metricGroups.textContent = "0";
     elements.metricFields.textContent = "0";
     elements.metricAssets.textContent = "0";
+    elements.metricMeshes.textContent = "0";
     elements.metricChanges.textContent = "0";
     return;
   }
@@ -405,10 +462,12 @@ function renderMetrics() {
   const groups = Object.keys(state.model.playgroundOverrides).length;
   const fields = getAllFieldEntries(state.model.playgroundOverrides).length;
   const assets = getEditableAssetEntries().length;
+  const meshes = state.bundleInspection.meshCount || 0;
   const changes = getChangeCount();
   elements.metricGroups.textContent = String(groups);
   elements.metricFields.textContent = String(fields);
   elements.metricAssets.textContent = String(assets);
+  elements.metricMeshes.textContent = String(meshes);
   elements.metricChanges.textContent = String(changes);
 }
 
@@ -429,12 +488,14 @@ function renderEditor() {
   const packageConfigMarkup = renderPackageConfigSection();
   const preloaderMarkup = renderPreloaderSection();
   const assetsMarkup = renderAssetsSection();
+  const meshMarkup = renderMeshSection();
   const advancedMarkup = renderAdvancedSection();
   const groupsMarkup = renderPlayableGroups();
   const markup = [
     packageConfigMarkup,
     preloaderMarkup,
     assetsMarkup,
+    meshMarkup,
     advancedMarkup,
     groupsMarkup,
   ]
@@ -733,6 +794,1201 @@ function renderAssetsSection() {
       </div>
     </details>
   `;
+}
+
+function renderMeshSection() {
+  const inspection = state.bundleInspection;
+  if (!inspection || inspection.status === "idle") {
+    return "";
+  }
+
+  const sectionMatchesSearch =
+    !state.search || "mesh bundles luna bundle 3d geometry".includes(state.search);
+  const visibleBundles = getVisibleMeshBundles(inspection, state.search);
+  if (
+    inspection.status === "ready" &&
+    !visibleBundles.length &&
+    state.search &&
+    !sectionMatchesSearch
+  ) {
+    return "";
+  }
+
+  const open = state.search || inspection.status === "loading" ? "open" : "";
+  const bundlesWithMeshes = inspection.bundles.filter((bundle) => bundle.meshCount > 0);
+  const badge =
+    inspection.status === "loading"
+      ? "Scanning"
+      : `${inspection.meshCount} mesh${inspection.meshCount === 1 ? "" : "es"}`;
+
+  return `
+    <details class="section-card" ${open}>
+      <summary>
+        <div class="section-title">
+          <div>
+            <h3>Mesh Bundles</h3>
+            <div class="section-meta">Inspect Luna mesh bundles and replace a mesh with another Luna export or a custom OBJ upload</div>
+          </div>
+        </div>
+        <span class="field-badge">${escapeHtml(badge)}</span>
+      </summary>
+      <div class="section-body">
+        ${
+          inspection.status === "loading"
+            ? `
+              <div class="empty-state">
+                <h2>Inspecting meshes</h2>
+                <p>${escapeHtml(inspection.message)}</p>
+              </div>
+            `
+            : inspection.status === "error" || inspection.status === "unsupported"
+              ? `
+                <div class="empty-state">
+                  <h2>Mesh inspection unavailable</h2>
+                  <p>${escapeHtml(inspection.message)}</p>
+                </div>
+              `
+              : inspection.status === "empty"
+                ? `
+                  <div class="empty-state">
+                    <h2>No readable bundle metadata</h2>
+                    <p>${escapeHtml(inspection.message)}</p>
+                  </div>
+                `
+                : bundlesWithMeshes.length
+                  ? `
+                    <div class="mesh-overview">
+                      ${renderMeshOverviewStat("Bundles", inspection.bundleCount)}
+                      ${renderMeshOverviewStat("Mesh Bundles", inspection.meshBundleCount)}
+                      ${renderMeshOverviewStat("Meshes", inspection.meshCount)}
+                      ${renderMeshOverviewStat(
+                        "Blob Data",
+                        inspection.bundles.some((bundle) => bundle.dataBlobByteLength != null)
+                          ? formatBytes(
+                              inspection.bundles.reduce(
+                                (total, bundle) => total + (bundle.dataBlobByteLength || 0),
+                                0
+                              )
+                            )
+                          : "N/A"
+                      )}
+                    </div>
+                    ${
+                      inspection.message
+                        ? `<div class="field-summary">${escapeHtml(inspection.message)}</div>`
+                        : ""
+                    }
+                    ${visibleBundles.map((bundle) => renderMeshBundleCard(bundle, state.search)).join("")}
+                  `
+                  : `
+                    <div class="empty-state">
+                      <h2>No meshes found</h2>
+                      <p>${escapeHtml(inspection.message || "This export includes Luna bundles, but none of the readable bundles contain mesh entries.")}</p>
+                    </div>
+                  `
+        }
+      </div>
+    </details>
+  `;
+}
+
+function renderMeshOverviewStat(label, value) {
+  return `
+    <div class="mesh-overview__stat">
+      <span class="mesh-overview__label">${escapeHtml(label)}</span>
+      <span class="mesh-overview__value">${escapeHtml(String(value))}</span>
+    </div>
+  `;
+}
+
+function renderMeshBundleCard(bundle, search) {
+  return `
+    <article class="field-card">
+      <div class="field-card__header">
+        <div>
+          <h4 class="field-title">Bundle ${escapeHtml(bundle.bundleId)}</h4>
+          <div class="section-meta">${escapeHtml(bundle.bundlePath)}</div>
+        </div>
+        <span class="field-badge">${escapeHtml(
+          `${bundle.meshCount} mesh${bundle.meshCount === 1 ? "" : "es"}`
+        )}</span>
+      </div>
+      <div class="mesh-overview">
+        ${renderMeshOverviewStat("Meshes", bundle.meshCount)}
+        ${renderMeshOverviewStat("Handlers", bundle.handlerCount)}
+        ${renderMeshOverviewStat("Blob", bundle.dataBlobByteLength != null ? formatBytes(bundle.dataBlobByteLength) : "N/A")}
+      </div>
+      <div class="field-summary">Assets: ${escapeHtml(describeBundleAssetCounts(bundle.assetCounts))}</div>
+      ${
+        bundle.dataBlobPath
+          ? `<div class="field-summary">Blob path: ${escapeHtml(bundle.dataBlobPath)}</div>`
+          : ""
+      }
+      ${
+        bundle.dataBlobError
+          ? `<div class="field-summary">${escapeHtml(bundle.dataBlobError)}</div>`
+          : ""
+      }
+      <div class="mesh-list">
+        ${bundle.meshes.map((mesh) => renderMeshEntryCard(mesh, search)).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderMeshEntryCard(mesh, search) {
+  const override = state.meshOverrides[mesh.id];
+  const donorChoice = state.meshDonorChoices[mesh.id];
+  const displayMesh = override?.displayMesh || mesh;
+  const open = search && doesMeshMatchSearch(mesh, search) ? "open" : "";
+  const fallbackTitle = displayMesh.name || displayMesh.path || `Mesh ${displayMesh.id}`;
+  const summary = [
+    displayMesh.vertexCount != null
+      ? `${formatNumber(displayMesh.vertexCount)} vertices`
+      : "",
+    `${displayMesh.subMeshCount} submesh${displayMesh.subMeshCount === 1 ? "" : "es"}`,
+    displayMesh.totalByteLength != null ? formatBytes(displayMesh.totalByteLength) : "",
+  ]
+    .filter(Boolean)
+    .join(" • ");
+
+  return `
+    <details class="mesh-entry-card" ${open}>
+      <summary>
+        <div>
+          <h4 class="field-title">${escapeHtml(fallbackTitle)}</h4>
+          <div class="section-meta">${escapeHtml(summary || "Mesh metadata")}</div>
+        </div>
+        <span class="field-badge">ID ${escapeHtml(String(displayMesh.id))}</span>
+      </summary>
+      <div class="mesh-entry-card__body">
+        ${
+          override
+            ? `<div class="field-summary">Replacement ready: ${escapeHtml(override.label)}</div>`
+            : `<div class="field-summary">Using the original Luna mesh data embedded in this export.</div>`
+        }
+        <div class="mesh-entry-card__meta">
+          ${renderMeshChip(
+            "Vertices",
+            displayMesh.vertexCount != null ? formatNumber(displayMesh.vertexCount) : "N/A"
+          )}
+          ${renderMeshChip("Submeshes", formatNumber(displayMesh.subMeshCount))}
+          ${renderMeshChip(
+            "Vertex Blob",
+            displayMesh.vertexBlobByteLength != null
+              ? formatBytes(displayMesh.vertexBlobByteLength)
+              : "N/A"
+          )}
+          ${renderMeshChip(
+            "Blob Span",
+            displayMesh.totalByteLength != null ? formatBytes(displayMesh.totalByteLength) : "N/A"
+          )}
+          ${renderMeshChip("Channels", formatNumber(displayMesh.channelCount))}
+          ${renderMeshChip(
+            "Half Precision",
+            displayMesh.halfPrecision == null
+              ? "Unknown"
+              : displayMesh.halfPrecision
+                ? "Yes"
+                : "No"
+          )}
+        </div>
+        ${
+          displayMesh.path
+            ? `<div class="field-summary mesh-entry-card__path">Path: ${escapeHtml(displayMesh.path)}</div>`
+            : ""
+        }
+        ${
+          displayMesh.boundsSummary
+            ? `<div class="field-summary">Bounds: ${escapeHtml(displayMesh.boundsSummary)}</div>`
+            : ""
+        }
+        ${
+          displayMesh.indexRangesSummary
+            ? `<div class="field-summary">Index ranges: ${escapeHtml(displayMesh.indexRangesSummary)}</div>`
+            : ""
+        }
+        <div class="field-summary">
+          Bind poses: ${escapeHtml(String(displayMesh.bindPoseCount))}
+          • Blend shapes: ${escapeHtml(String(displayMesh.blendShapeCount))}
+          • Raw fields: ${escapeHtml(String(displayMesh.rawDataLength))}
+        </div>
+        ${renderMeshReplacementControls(mesh, donorChoice, override)}
+      </div>
+    </details>
+  `;
+}
+
+function renderMeshChip(label, value) {
+  return `
+    <div class="mesh-chip">
+      <span class="mesh-chip__label">${escapeHtml(label)}</span>
+      <span class="mesh-chip__value">${escapeHtml(String(value))}</span>
+    </div>
+  `;
+}
+
+function renderMeshReplacementControls(mesh, donorChoice, override) {
+  const targetMesh = state.bundleInspection.meshesById?.[mesh.id];
+  const replacementEnabled = Boolean(targetMesh?.bundle?.rawBlobBytes);
+
+  if (!replacementEnabled) {
+    return `<div class="field-summary">This mesh cannot be replaced yet because its source bundle blob was not decoded successfully.</div>`;
+  }
+
+  const options = donorChoice?.options || [];
+  const selectedKey = donorChoice?.selectedKey || "";
+  const statusMessage =
+    donorChoice?.status === "loading"
+      ? "Reading donor Luna HTML and extracting mesh candidates..."
+      : donorChoice?.status === "error"
+        ? donorChoice.message
+        : donorChoice?.fileName
+          ? `${donorChoice.fileName} loaded with ${options.length} candidate mesh${
+              options.length === 1 ? "" : "es"
+            }.`
+          : "Upload another Luna HTML export to use one of its meshes as the donor.";
+
+  return `
+    <div class="mesh-replacement">
+      <div class="field-summary">${escapeHtml(statusMessage)}</div>
+      <div class="field-summary">
+        Custom uploads currently support static Wavefront OBJ meshes. Skinned meshes and blend shapes are not supported yet.
+      </div>
+      <div class="field-inline field-inline--stack">
+        <label class="button button--ghost file-button">
+          <input
+            type="file"
+            accept=".html,text/html"
+            data-action="mesh-donor-upload"
+            data-mesh-id="${escapeAttribute(mesh.id)}"
+          />
+          <span>Upload Donor Luna HTML</span>
+        </label>
+        <label class="button button--ghost file-button">
+          <input
+            type="file"
+            accept=".obj,text/plain"
+            data-action="mesh-custom-upload"
+            data-mesh-id="${escapeAttribute(mesh.id)}"
+          />
+          <span>Upload Custom OBJ</span>
+        </label>
+        ${
+          options.length
+            ? `
+              <label class="mini-label">
+                <span>Donor mesh</span>
+                <select data-action="mesh-donor-select" data-mesh-id="${escapeAttribute(
+                  mesh.id
+                )}">
+                  ${options
+                    .map(
+                      (option) => `
+                        <option value="${escapeAttribute(option.key)}" ${
+                          option.key === selectedKey ? "selected" : ""
+                        }>
+                          ${escapeHtml(option.label)}
+                        </option>
+                      `
+                    )
+                    .join("")}
+                </select>
+              </label>
+              <div class="mesh-actions">
+                <button
+                  class="button button--primary"
+                  type="button"
+                  data-action="mesh-donor-apply"
+                  data-mesh-id="${escapeAttribute(mesh.id)}"
+                >
+                  Apply Mesh Replacement
+                </button>
+                ${
+                  override
+                    ? `
+                      <button
+                        class="button button--ghost"
+                        type="button"
+                        data-action="mesh-donor-reset"
+                        data-mesh-id="${escapeAttribute(mesh.id)}"
+                      >
+                        Reset Mesh
+                      </button>
+                    `
+                    : ""
+                }
+              </div>
+            `
+            : override
+              ? `
+                <div class="mesh-actions">
+                  <button
+                    class="button button--ghost"
+                    type="button"
+                    data-action="mesh-donor-reset"
+                    data-mesh-id="${escapeAttribute(mesh.id)}"
+                  >
+                    Reset Mesh
+                  </button>
+                </div>
+              `
+              : ""
+        }
+      </div>
+    </div>
+  `;
+}
+
+async function processMeshDonorFile(meshId, file) {
+  if (!meshId || !file) {
+    return;
+  }
+
+  const targetMesh = state.bundleInspection.meshesById?.[meshId];
+  if (!targetMesh) {
+    state.status = {
+      kind: "error",
+      message: `Target mesh ${meshId} is not available for replacement.`,
+    };
+    updateStatusBanner();
+    return;
+  }
+
+  state.meshDonorChoices[meshId] = {
+    status: "loading",
+    fileName: file.name,
+    options: [],
+    selectedKey: "",
+    message: "Reading donor Luna HTML...",
+  };
+  renderEditor();
+
+  try {
+    const html = await file.text();
+    const donorInspection = await analyzeMeshBundlesFromHtml(html);
+    const options = buildDonorMeshOptions(donorInspection, targetMesh);
+    if (!options.length) {
+      throw new Error(
+        "No donor meshes with readable blob data were found in that Luna HTML export."
+      );
+    }
+
+    state.meshDonorChoices[meshId] = {
+      status: "ready",
+      fileName: file.name,
+      options,
+      selectedKey: pickDefaultDonorOption(options, targetMesh),
+      message: "",
+    };
+    state.status = {
+      kind: "ready",
+      message: `${file.name} loaded. Pick a donor mesh and apply the replacement.`,
+    };
+    renderEditor();
+    updateStatusBanner();
+  } catch (error) {
+    state.meshDonorChoices[meshId] = {
+      status: "error",
+      fileName: file.name,
+      options: [],
+      selectedKey: "",
+      message: getErrorMessage(error),
+    };
+    state.status = {
+      kind: "error",
+      message: `Could not read donor mesh data from ${file.name}: ${getErrorMessage(error)}`,
+    };
+    renderEditor();
+    updateStatusBanner();
+  }
+}
+
+async function processCustomMeshFile(meshId, file) {
+  if (!meshId || !file) {
+    return;
+  }
+
+  const targetMesh = state.bundleInspection.meshesById?.[meshId];
+  if (!targetMesh?.rawEntry) {
+    state.status = {
+      kind: "error",
+      message: `Target mesh ${meshId} is not available for custom replacement.`,
+    };
+    updateStatusBanner();
+    return;
+  }
+
+  state.status = {
+    kind: "ready",
+    message: `Reading ${file.name} and building a custom Luna mesh payload...`,
+  };
+  updateStatusBanner();
+
+  try {
+    const text = await file.text();
+    const objModel = parseWavefrontObj(text, file.name);
+    const payload = createCustomObjMeshReplacementPayload(targetMesh, objModel);
+
+    state.meshOverrides[meshId] = {
+      label: `${file.name} (custom OBJ)`,
+      payload,
+      displayMesh: createCustomObjPreviewMesh(targetMesh, file.name, payload.summary),
+      donorFileName: file.name,
+    };
+    onMeshOverridesUpdated(
+      `Mesh ${targetMesh.name || meshId} will be replaced with custom OBJ geometry from ${file.name}.`
+    );
+  } catch (error) {
+    state.status = {
+      kind: "error",
+      message: `Could not build a Luna mesh from ${file.name}: ${getErrorMessage(error)}`,
+    };
+    updateStatusBanner();
+  }
+}
+
+function parseWavefrontObj(text, fallbackName = "") {
+  const positions = [];
+  const texcoords = [];
+  const normals = [];
+  const groups = [];
+  let currentGroup = createObjGroup(fallbackName || "OBJ Mesh");
+
+  const ensureCurrentGroup = () => {
+    if (!currentGroup) {
+      currentGroup = createObjGroup(fallbackName || "OBJ Mesh");
+    }
+    return currentGroup;
+  };
+
+  const startNewGroup = (label) => {
+    if (currentGroup && currentGroup.triangles.length) {
+      groups.push(currentGroup);
+      currentGroup = createObjGroup(label);
+      return;
+    }
+
+    const nextGroup = ensureCurrentGroup();
+    nextGroup.name = label || nextGroup.name;
+  };
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const parts = line.split(/\s+/);
+    const keyword = parts[0];
+
+    if (keyword === "v") {
+      if (parts.length < 4) {
+        throw new Error("OBJ vertex rows must include X, Y, and Z components.");
+      }
+      positions.push(parts.slice(1, 4).map(parseObjNumber));
+      continue;
+    }
+
+    if (keyword === "vt") {
+      if (parts.length < 3) {
+        throw new Error("OBJ texture coordinate rows must include U and V values.");
+      }
+      texcoords.push(parts.slice(1, 3).map(parseObjNumber));
+      continue;
+    }
+
+    if (keyword === "vn") {
+      if (parts.length < 4) {
+        throw new Error("OBJ normal rows must include X, Y, and Z components.");
+      }
+      normals.push(parts.slice(1, 4).map(parseObjNumber));
+      continue;
+    }
+
+    if (keyword === "o" || keyword === "g" || keyword === "usemtl") {
+      startNewGroup(parts.slice(1).join(" ") || keyword);
+      continue;
+    }
+
+    if (keyword === "f") {
+      if (parts.length < 4) {
+        throw new Error("OBJ face rows must include at least three vertices.");
+      }
+
+      const faceVertices = parts.slice(1).map(parseObjFaceToken);
+      const group = ensureCurrentGroup();
+      for (let index = 1; index < faceVertices.length - 1; index += 1) {
+        group.triangles.push([
+          faceVertices[0],
+          faceVertices[index],
+          faceVertices[index + 1],
+        ]);
+      }
+    }
+  }
+
+  if (currentGroup && currentGroup.triangles.length) {
+    groups.push(currentGroup);
+  }
+
+  if (!positions.length) {
+    throw new Error("The OBJ file does not include any vertex positions.");
+  }
+
+  if (!groups.length) {
+    throw new Error("The OBJ file does not include any triangle faces.");
+  }
+
+  return {
+    name: groups[0]?.name || fallbackName || "OBJ Mesh",
+    positions,
+    texcoords,
+    normals,
+    groups,
+  };
+}
+
+function createObjGroup(name) {
+  return {
+    name: name || "OBJ Mesh",
+    triangles: [],
+  };
+}
+
+function parseObjFaceToken(token) {
+  const [v, vt, vn] = token.split("/");
+  return {
+    v: parseObjIndexToken(v, "vertex"),
+    vt: parseObjIndexToken(vt, "uv", true),
+    vn: parseObjIndexToken(vn, "normal", true),
+  };
+}
+
+function parseObjIndexToken(token, label, optional = false) {
+  if (!token) {
+    if (optional) {
+      return 0;
+    }
+    throw new Error(`The OBJ file includes a face without a ${label} index.`);
+  }
+
+  const value = parseInteger(token);
+  if (value == null || value === 0) {
+    if (optional) {
+      return 0;
+    }
+    throw new Error(`The OBJ file includes an invalid ${label} index: ${token}`);
+  }
+  return value;
+}
+
+function parseObjNumber(value) {
+  const parsed = parseFloatStrict(value);
+  if (parsed == null) {
+    throw new Error(`The OBJ file contains an invalid number: ${value}`);
+  }
+  return parsed;
+}
+
+function createCustomObjMeshReplacementPayload(targetMesh, objModel) {
+  const targetEntry = targetMesh.rawEntry;
+  const targetData = Array.isArray(targetEntry?.data) ? targetEntry.data : [];
+  const streams = Array.isArray(targetData[5]) ? targetData[5].slice() : [];
+
+  if (!streams.length) {
+    throw new Error("The target Luna mesh does not expose a readable stream layout.");
+  }
+  if (streams[3] || streams[4]) {
+    throw new Error("Skinned Luna meshes are not supported for custom OBJ replacement yet.");
+  }
+  if (Array.isArray(targetData[8]) && targetData[8].length) {
+    throw new Error("Meshes with bind poses are not supported for custom OBJ replacement yet.");
+  }
+  if (Array.isArray(targetData[9]) && targetData[9].length) {
+    throw new Error("Meshes with blend shapes are not supported for custom OBJ replacement yet.");
+  }
+
+  const geometry = buildCustomObjGeometry(objModel, streams, targetMesh.subMeshCount || 1);
+  const customEntry = deepClone(targetEntry);
+
+  customEntry.data[0] = objModel.name || customEntry.data[0] || "Custom OBJ";
+  customEntry.data[1] = false;
+  customEntry.data[2] = geometry.useUInt32IndexFormat;
+  customEntry.data[3] = geometry.vertexCount;
+  customEntry.data[4] = geometry.aabb;
+  customEntry.data[5] = streams;
+  customEntry.data[6] = [0, geometry.vertexByteLength];
+  customEntry.data[7] = geometry.subMeshMarkers.map((marker) => [marker]);
+  customEntry.data[8] = [];
+  customEntry.data[9] = [];
+
+  return {
+    entry: customEntry,
+    blobBytes: geometry.blobBytes,
+    summary: geometry.summary,
+  };
+}
+
+function buildCustomObjGeometry(objModel, streams, targetSubMeshCount) {
+  const groups = objModel.groups;
+  const positions = objModel.positions;
+  const texcoords = objModel.texcoords;
+  const normals = objModel.normals;
+  const vertexMap = new Map();
+  const vertices = [];
+  const groupIndices = groups.map(() => []);
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    const group = groups[groupIndex];
+    const indices = groupIndices[groupIndex];
+
+    for (const triangle of group.triangles) {
+      for (const corner of triangle) {
+        const positionIndex = resolveObjReference(corner.v, positions.length, "vertex");
+        const texcoordIndex = corner.vt
+          ? resolveObjReference(corner.vt, texcoords.length, "uv")
+          : 0;
+        const normalIndex = corner.vn
+          ? resolveObjReference(corner.vn, normals.length, "normal")
+          : 0;
+        const key = `${positionIndex}/${texcoordIndex}/${normalIndex}`;
+
+        let vertexIndex = vertexMap.get(key);
+        if (vertexIndex == null) {
+          vertexIndex = vertices.length;
+          vertexMap.set(key, vertexIndex);
+          vertices.push({
+            position: positions[positionIndex - 1].slice(0, 3),
+            uv0: texcoordIndex ? texcoords[texcoordIndex - 1].slice(0, 2) : null,
+            normal: normalIndex ? normals[normalIndex - 1].slice(0, 3) : null,
+          });
+        }
+
+        indices.push(vertexIndex);
+      }
+    }
+  }
+
+  if (!vertices.length) {
+    throw new Error("The OBJ file did not produce any usable triangle vertices.");
+  }
+
+  populateMissingNormals(vertices, groupIndices);
+  populateTangents(vertices, groupIndices);
+
+  const subMeshIndices = fitObjGroupsToTargetSubMeshes(
+    groupIndices,
+    Math.max(1, targetSubMeshCount)
+  );
+  const useUInt32IndexFormat =
+    vertices.length > 65535 ||
+    subMeshIndices.some((indices) => indices.some((value) => value > 65535));
+  const vertexFloats = buildVertexFloatBuffer(vertices, streams);
+  const vertexByteLength = vertexFloats.byteLength;
+  const blobParts = [];
+  blobParts.push(new Uint8Array(vertexFloats.buffer.slice(0)));
+
+  let nextOffset = vertexByteLength;
+  const subMeshMarkers = [];
+  const subMeshRangesForSummary = [];
+
+  for (const indices of subMeshIndices) {
+    const typedIndices = useUInt32IndexFormat
+      ? new Uint32Array(indices)
+      : new Uint16Array(indices);
+    const byteLength = typedIndices.byteLength;
+    subMeshMarkers.push([nextOffset, byteLength]);
+    subMeshRangesForSummary.push([[nextOffset, byteLength]]);
+    blobParts.push(new Uint8Array(typedIndices.buffer.slice(0)));
+    nextOffset += byteLength;
+  }
+
+  const blobBytes = concatUint8Arrays(blobParts);
+  const aabb = computeObjAabb(vertices);
+  const indexRangeStats = summarizeMeshIndexRanges(subMeshRangesForSummary);
+
+  return {
+    vertexCount: vertices.length,
+    vertexByteLength,
+    blobBytes,
+    subMeshMarkers,
+    useUInt32IndexFormat,
+    aabb,
+    summary: {
+      vertexCount: vertices.length,
+      subMeshCount: subMeshIndices.length,
+      vertexBlobByteLength: vertexByteLength,
+      totalByteLength: blobBytes.byteLength,
+      boundsSummary: formatBounds(aabbToSummaryBounds(aabb)),
+      indexRangesSummary: indexRangeStats.summary,
+      channelCount: streams.length,
+      halfPrecision: false,
+      bindPoseCount: 0,
+      blendShapeCount: 0,
+      rawDataLength: 10,
+    },
+  };
+}
+
+function resolveObjReference(value, length, label) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`The OBJ file includes an invalid ${label} index: ${value}`);
+  }
+
+  const resolved = parsed < 0 ? length + parsed + 1 : parsed;
+  if (resolved < 1 || resolved > length) {
+    throw new Error(`The OBJ file references ${label} ${value}, but only ${length} are available.`);
+  }
+
+  return resolved;
+}
+
+function populateMissingNormals(vertices, groupIndices) {
+  const missingNormals = vertices.some((vertex) => !Array.isArray(vertex.normal));
+  if (!missingNormals) {
+    vertices.forEach((vertex) => {
+      vertex.normal = normalizeVec3(vertex.normal);
+    });
+    return;
+  }
+
+  const accumulators = vertices.map(() => [0, 0, 0]);
+  for (const indices of groupIndices) {
+    for (let index = 0; index < indices.length; index += 3) {
+      const a = vertices[indices[index]];
+      const b = vertices[indices[index + 1]];
+      const c = vertices[indices[index + 2]];
+      const faceNormal = computeFaceNormal(a.position, b.position, c.position);
+      accumulateVec3(accumulators[indices[index]], faceNormal);
+      accumulateVec3(accumulators[indices[index + 1]], faceNormal);
+      accumulateVec3(accumulators[indices[index + 2]], faceNormal);
+    }
+  }
+
+  vertices.forEach((vertex, index) => {
+    vertex.normal = Array.isArray(vertex.normal)
+      ? normalizeVec3(vertex.normal)
+      : normalizeVec3(accumulators[index], [0, 1, 0]);
+  });
+}
+
+function populateTangents(vertices, groupIndices) {
+  const tan1 = vertices.map(() => [0, 0, 0]);
+  const tan2 = vertices.map(() => [0, 0, 0]);
+
+  for (const indices of groupIndices) {
+    for (let index = 0; index < indices.length; index += 3) {
+      const i0 = indices[index];
+      const i1 = indices[index + 1];
+      const i2 = indices[index + 2];
+      const v0 = vertices[i0];
+      const v1 = vertices[i1];
+      const v2 = vertices[i2];
+
+      if (!(v0.uv0 && v1.uv0 && v2.uv0)) {
+        continue;
+      }
+
+      const tangentFrame = computeTriangleTangents(
+        v0.position,
+        v1.position,
+        v2.position,
+        v0.uv0,
+        v1.uv0,
+        v2.uv0
+      );
+
+      if (!tangentFrame) {
+        continue;
+      }
+
+      accumulateVec3(tan1[i0], tangentFrame.sdir);
+      accumulateVec3(tan1[i1], tangentFrame.sdir);
+      accumulateVec3(tan1[i2], tangentFrame.sdir);
+      accumulateVec3(tan2[i0], tangentFrame.tdir);
+      accumulateVec3(tan2[i1], tangentFrame.tdir);
+      accumulateVec3(tan2[i2], tangentFrame.tdir);
+    }
+  }
+
+  vertices.forEach((vertex, index) => {
+    vertex.tangent = buildVertexTangent(vertex.normal, tan1[index], tan2[index]);
+  });
+}
+
+function fitObjGroupsToTargetSubMeshes(groupIndices, targetSubMeshCount) {
+  const subMeshes = Array.from({ length: targetSubMeshCount }, () => []);
+
+  if (groupIndices.length === 1) {
+    subMeshes[0].push(...groupIndices[0]);
+    return subMeshes;
+  }
+
+  groupIndices.forEach((indices, index) => {
+    const slot = Math.min(index, targetSubMeshCount - 1);
+    subMeshes[slot].push(...indices);
+  });
+
+  return subMeshes;
+}
+
+function buildVertexFloatBuffer(vertices, streams) {
+  const stride = getLunaStreamStride(streams);
+  const floats = new Float32Array(vertices.length * stride);
+  let offset = 0;
+
+  for (const vertex of vertices) {
+    if (streams[0]) {
+      floats.set(vertex.position, offset);
+      offset += 3;
+    }
+    if (streams[1]) {
+      floats.set(vertex.normal || [0, 1, 0], offset);
+      offset += 3;
+    }
+    if (streams[2]) {
+      floats.set(vertex.tangent || [1, 0, 0, 1], offset);
+      offset += 4;
+    }
+    if (streams[3]) {
+      floats.set([1, 0, 0, 0], offset);
+      offset += 4;
+    }
+    if (streams[4]) {
+      floats.set([0, 0, 0, 0], offset);
+      offset += 4;
+    }
+    if (streams[5]) {
+      floats.set([1, 1, 1, 1], offset);
+      offset += 4;
+    }
+    if (streams[6]) {
+      floats.set(vertex.uv0 || [0, 0], offset);
+      offset += 2;
+    }
+    if (streams[7]) {
+      floats.set([0, 0], offset);
+      offset += 2;
+    }
+    if (streams[8]) {
+      floats.set([0, 0], offset);
+      offset += 2;
+    }
+    if (streams[9]) {
+      floats.set([0, 0], offset);
+      offset += 2;
+    }
+  }
+
+  return floats;
+}
+
+function getLunaStreamStride(streams) {
+  const componentCounts = [3, 3, 4, 4, 4, 4, 2, 2, 2, 2];
+  return streams.reduce(
+    (total, enabled, index) => total + (enabled ? componentCounts[index] : 0),
+    0
+  );
+}
+
+function computeObjAabb(vertices) {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  for (const vertex of vertices) {
+    const [x, y, z] = vertex.position;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    minZ = Math.min(minZ, z);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+    maxZ = Math.max(maxZ, z);
+  }
+
+  return [
+    (minX + maxX) / 2,
+    (minY + maxY) / 2,
+    (minZ + maxZ) / 2,
+    (maxX - minX) / 2,
+    (maxY - minY) / 2,
+    (maxZ - minZ) / 2,
+  ];
+}
+
+function aabbToSummaryBounds(aabb) {
+  return [
+    aabb[0] - aabb[3],
+    aabb[1] - aabb[4],
+    aabb[2] - aabb[5],
+    aabb[0] + aabb[3],
+    aabb[1] + aabb[4],
+    aabb[2] + aabb[5],
+  ];
+}
+
+function computeFaceNormal(a, b, c) {
+  const edge1 = subtractVec3(b, a);
+  const edge2 = subtractVec3(c, a);
+  return normalizeVec3(crossVec3(edge1, edge2), [0, 1, 0]);
+}
+
+function computeTriangleTangents(position0, position1, position2, uv0, uv1, uv2) {
+  const edge1 = subtractVec3(position1, position0);
+  const edge2 = subtractVec3(position2, position0);
+  const deltaUv1 = subtractVec2(uv1, uv0);
+  const deltaUv2 = subtractVec2(uv2, uv0);
+  const determinant = deltaUv1[0] * deltaUv2[1] - deltaUv1[1] * deltaUv2[0];
+
+  if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-8) {
+    return null;
+  }
+
+  const factor = 1 / determinant;
+  return {
+    sdir: [
+      factor * (deltaUv2[1] * edge1[0] - deltaUv1[1] * edge2[0]),
+      factor * (deltaUv2[1] * edge1[1] - deltaUv1[1] * edge2[1]),
+      factor * (deltaUv2[1] * edge1[2] - deltaUv1[1] * edge2[2]),
+    ],
+    tdir: [
+      factor * (deltaUv1[0] * edge2[0] - deltaUv2[0] * edge1[0]),
+      factor * (deltaUv1[0] * edge2[1] - deltaUv2[0] * edge1[1]),
+      factor * (deltaUv1[0] * edge2[2] - deltaUv2[0] * edge1[2]),
+    ],
+  };
+}
+
+function buildVertexTangent(normal, tangentAccum, bitangentAccum) {
+  const safeNormal = normalizeVec3(normal, [0, 1, 0]);
+  let tangent = subtractVec3(
+    tangentAccum,
+    scaleVec3(safeNormal, dotVec3(safeNormal, tangentAccum))
+  );
+
+  if (lengthVec3(tangent) < 1e-5) {
+    tangent = chooseOrthogonalTangent(safeNormal);
+  } else {
+    tangent = normalizeVec3(tangent);
+  }
+
+  const handedness =
+    dotVec3(crossVec3(safeNormal, tangent), bitangentAccum) < 0 ? -1 : 1;
+  return [tangent[0], tangent[1], tangent[2], handedness];
+}
+
+function chooseOrthogonalTangent(normal) {
+  const helper = Math.abs(normal[1]) < 0.999 ? [0, 1, 0] : [1, 0, 0];
+  return normalizeVec3(crossVec3(helper, normal), [1, 0, 0]);
+}
+
+function normalizeVec3(vector, fallback = [0, 0, 1]) {
+  const length = lengthVec3(vector);
+  if (!Number.isFinite(length) || length < 1e-8) {
+    return fallback.slice(0, 3);
+  }
+
+  return [vector[0] / length, vector[1] / length, vector[2] / length];
+}
+
+function lengthVec3(vector) {
+  return Math.hypot(vector[0] || 0, vector[1] || 0, vector[2] || 0);
+}
+
+function subtractVec3(left, right) {
+  return [
+    (left[0] || 0) - (right[0] || 0),
+    (left[1] || 0) - (right[1] || 0),
+    (left[2] || 0) - (right[2] || 0),
+  ];
+}
+
+function subtractVec2(left, right) {
+  return [
+    (left[0] || 0) - (right[0] || 0),
+    (left[1] || 0) - (right[1] || 0),
+  ];
+}
+
+function scaleVec3(vector, scalar) {
+  return [(vector[0] || 0) * scalar, (vector[1] || 0) * scalar, (vector[2] || 0) * scalar];
+}
+
+function dotVec3(left, right) {
+  return (
+    (left[0] || 0) * (right[0] || 0) +
+    (left[1] || 0) * (right[1] || 0) +
+    (left[2] || 0) * (right[2] || 0)
+  );
+}
+
+function crossVec3(left, right) {
+  return [
+    (left[1] || 0) * (right[2] || 0) - (left[2] || 0) * (right[1] || 0),
+    (left[2] || 0) * (right[0] || 0) - (left[0] || 0) * (right[2] || 0),
+    (left[0] || 0) * (right[1] || 0) - (left[1] || 0) * (right[0] || 0),
+  ];
+}
+
+function accumulateVec3(target, value) {
+  target[0] += value[0] || 0;
+  target[1] += value[1] || 0;
+  target[2] += value[2] || 0;
+}
+
+function createCustomObjPreviewMesh(targetMesh, fileName, summary) {
+  return {
+    ...targetMesh,
+    name: fileName.replace(/\.obj$/i, "") || targetMesh.name,
+    path: fileName,
+    vertexCount: summary.vertexCount,
+    vertexBlobByteLength: summary.vertexBlobByteLength,
+    subMeshCount: summary.subMeshCount,
+    totalByteLength: summary.totalByteLength,
+    indexRangesSummary: summary.indexRangesSummary,
+    boundsSummary: summary.boundsSummary,
+    channelCount: summary.channelCount,
+    halfPrecision: summary.halfPrecision,
+    bindPoseCount: summary.bindPoseCount,
+    blendShapeCount: summary.blendShapeCount,
+    rawDataLength: summary.rawDataLength,
+  };
+}
+
+function buildDonorMeshOptions(inspection, targetMesh) {
+  if (inspection.status !== "ready") {
+    throw new Error(inspection.message || "The donor Luna HTML could not be inspected.");
+  }
+
+  const options = [];
+  for (const bundle of inspection.bundles) {
+    if (!(bundle.rawBlobBytes instanceof Uint8Array)) {
+      continue;
+    }
+
+    for (const mesh of bundle.meshes) {
+      if (!mesh.rawEntry) {
+        continue;
+      }
+
+      const payload = createNormalizedMeshReplacementPayload(mesh.rawEntry, bundle.rawBlobBytes);
+      options.push({
+        key: `${bundle.bundleId}:${mesh.id}`,
+        label: `${mesh.name || `Mesh ${mesh.id}`} • ${formatNumber(
+          mesh.vertexCount || 0
+        )} vertices • ${bundle.bundleId}`,
+        sourceLabel: `${mesh.name || `Mesh ${mesh.id}`} from ${bundle.bundlePath}`,
+        previewMesh: createReplacementPreviewMesh(targetMesh, mesh),
+        payload,
+      });
+    }
+  }
+
+  return options;
+}
+
+function pickDefaultDonorOption(options, targetMesh) {
+  const targetName = normalizeMeshSearchText(targetMesh.name || targetMesh.path || "");
+  const match = options.find((option) => {
+    const previewName = normalizeMeshSearchText(
+      option.previewMesh.name || option.previewMesh.path || ""
+    );
+    return targetName && previewName && previewName.includes(targetName);
+  });
+  return (match || options[0])?.key || "";
+}
+
+function normalizeMeshSearchText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.[a-z0-9]+$/i, "");
+}
+
+function updateMeshDonorSelection(meshId, selectedKey) {
+  const donorChoice = state.meshDonorChoices[meshId];
+  if (!donorChoice) {
+    return;
+  }
+
+  donorChoice.selectedKey = selectedKey;
+  renderEditor();
+}
+
+function applyMeshReplacement(meshId) {
+  const donorChoice = state.meshDonorChoices[meshId];
+  const targetMesh = state.bundleInspection.meshesById?.[meshId];
+
+  if (!donorChoice?.options?.length || !targetMesh) {
+    state.status = {
+      kind: "error",
+      message: "Upload a donor Luna HTML and pick a donor mesh before applying.",
+    };
+    updateStatusBanner();
+    return;
+  }
+
+  const selected = donorChoice.options.find((option) => option.key === donorChoice.selectedKey);
+  if (!selected) {
+    state.status = {
+      kind: "error",
+      message: "Choose a donor mesh before applying the replacement.",
+    };
+    updateStatusBanner();
+    return;
+  }
+
+  state.meshOverrides[meshId] = {
+    label: selected.sourceLabel,
+    payload: selected.payload,
+    displayMesh: selected.previewMesh,
+    donorFileName: donorChoice.fileName,
+  };
+  onMeshOverridesUpdated(
+    `Mesh ${targetMesh.name || meshId} will be replaced with ${selected.sourceLabel}.`
+  );
+}
+
+function resetMeshReplacement(meshId) {
+  const targetMesh = state.bundleInspection.meshesById?.[meshId];
+  delete state.meshOverrides[meshId];
+  onMeshOverridesUpdated(`Mesh ${targetMesh?.name || meshId} was reset to the original Luna data.`);
+}
+
+function createReplacementPreviewMesh(targetMesh, donorMesh) {
+  return {
+    ...targetMesh,
+    name: targetMesh.name || donorMesh.name,
+    path: targetMesh.path || donorMesh.path,
+    vertexCount: donorMesh.vertexCount,
+    vertexBlobByteLength: donorMesh.vertexBlobByteLength,
+    subMeshCount: donorMesh.subMeshCount,
+    totalByteLength: donorMesh.totalByteLength,
+    indexRangesSummary: donorMesh.indexRangesSummary,
+    boundsSummary: donorMesh.boundsSummary,
+    channelCount: donorMesh.channelCount,
+    halfPrecision: donorMesh.halfPrecision,
+    bindPoseCount: donorMesh.bindPoseCount,
+    blendShapeCount: donorMesh.blendShapeCount,
+    rawDataLength: donorMesh.rawDataLength,
+  };
+}
+
+function onMeshOverridesUpdated(message) {
+  state.status = {
+    kind: "ready",
+    message,
+  };
+  renderMetrics();
+  renderEditor();
+  updateStatusBanner();
+  layoutPreviewStage();
+  schedulePreviewRefresh();
 }
 
 function renderAdvancedSection() {
@@ -1144,6 +2400,15 @@ function handleEditorChange(event) {
         }
       });
       return;
+    case "mesh-donor-upload":
+      processMeshDonorFile(target.dataset.meshId, target.files?.[0]);
+      return;
+    case "mesh-custom-upload":
+      processCustomMeshFile(target.dataset.meshId, target.files?.[0]);
+      return;
+    case "mesh-donor-select":
+      updateMeshDonorSelection(target.dataset.meshId, target.value);
+      return;
     case "field-boolean":
       {
         const field = getFieldValue(target.dataset.group, target.dataset.field);
@@ -1205,6 +2470,16 @@ function handleEditorClick(event) {
       value: JSON.stringify(state.model[target], null, 2),
       target,
     });
+    return;
+  }
+
+  if (action === "mesh-donor-apply") {
+    applyMeshReplacement(button.dataset.meshId);
+    return;
+  }
+
+  if (action === "mesh-donor-reset") {
+    resetMeshReplacement(button.dataset.meshId);
   }
 }
 
@@ -1862,6 +3137,814 @@ function dispatchPreviewTouch(type, sourceEvent) {
   );
 }
 
+function createEmptyBundleInspection() {
+  return {
+    status: "idle",
+    message: "",
+    bundles: [],
+    meshesById: {},
+    bundleCount: 0,
+    meshBundleCount: 0,
+    meshCount: 0,
+    failedBundles: 0,
+  };
+}
+
+function createLoadingBundleInspection() {
+  return {
+    status: "loading",
+    message: "Inspecting embedded Luna bundles for mesh metadata...",
+    bundles: [],
+    meshesById: {},
+    bundleCount: 0,
+    meshBundleCount: 0,
+    meshCount: 0,
+    failedBundles: 0,
+  };
+}
+
+async function analyzeMeshBundlesFromHtml(html) {
+  const bundleSpecs = collectCompressedBundleJsonSpecs(html);
+  if (!bundleSpecs.length) {
+    return {
+      status: "empty",
+      message:
+        "No inline compressed Luna bundle.json blocks were detected. Mesh inspection currently reads the standard embedded Luna bundle metadata format.",
+      bundles: [],
+      meshesById: {},
+      bundleCount: 0,
+      meshBundleCount: 0,
+      meshCount: 0,
+      failedBundles: 0,
+    };
+  }
+
+  const brotliDecoder = extractBrotliDecoder(html);
+  const blobSpecsByPath = new Map(
+    collectCompressedBundleBlobSpecs(html).map((spec) => [spec.path, spec])
+  );
+
+  const results = await Promise.all(
+    bundleSpecs.map(async (spec) => {
+      try {
+        const jsonText = await decodeCompressedTextAsset(
+          spec.payloadLiteral,
+          spec.isBase122,
+          brotliDecoder
+        );
+        const bundleJson = JSON.parse(jsonText);
+        const dataBlobPath = getBundleDataBlobPath(spec.path);
+        const blobSpec = blobSpecsByPath.get(dataBlobPath);
+        let rawBlobBytes = null;
+        let dataBlobByteLength = null;
+        let dataBlobError = "";
+
+        if (blobSpec) {
+          try {
+            rawBlobBytes = await decodeCompressedBinaryAsset(
+              blobSpec.payloadLiteral,
+              blobSpec.isBase122,
+              brotliDecoder
+            );
+            dataBlobByteLength = rawBlobBytes.byteLength;
+          } catch (error) {
+            dataBlobError = `Data blob size unavailable: ${getErrorMessage(error)}`;
+          }
+        }
+
+        return {
+          ok: true,
+          bundle: summarizeMeshBundle(spec.path, bundleJson, {
+            dataBlobPath,
+            dataBlobByteLength,
+            dataBlobError,
+            rawBlobBytes,
+            rawJson: bundleJson,
+          }),
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          path: spec.path,
+          error: getErrorMessage(error),
+        };
+      }
+    })
+  );
+
+  const bundles = results
+    .filter((result) => result.ok)
+    .map((result) => result.bundle)
+    .sort((left, right) => compareAssetIds(left.bundleId, right.bundleId));
+  const failedBundles = results.filter((result) => !result.ok);
+
+  if (!bundles.length) {
+    return {
+      status: "error",
+      message:
+        failedBundles[0]?.error ||
+        "Bundle metadata was found, but none of it could be decoded successfully.",
+      bundles: [],
+      meshesById: {},
+      bundleCount: 0,
+      meshBundleCount: 0,
+      meshCount: 0,
+      failedBundles: failedBundles.length,
+    };
+  }
+
+  const meshBundleCount = bundles.filter((bundle) => bundle.meshCount > 0).length;
+  const meshCount = bundles.reduce((total, bundle) => total + bundle.meshCount, 0);
+  const meshesById = {};
+  for (const bundle of bundles) {
+    for (const mesh of bundle.meshes) {
+      meshesById[mesh.id] = mesh;
+    }
+  }
+  let message = `Inspected ${bundles.length} Luna bundle${
+    bundles.length === 1 ? "" : "s"
+  }.`;
+
+  if (meshCount > 0) {
+    message += ` Found ${meshCount} mesh record${
+      meshCount === 1 ? "" : "s"
+    } across ${meshBundleCount} bundle${meshBundleCount === 1 ? "" : "s"}.`;
+  } else {
+    message += " No mesh records were found in the readable bundles.";
+  }
+
+  if (failedBundles.length) {
+    message += ` ${failedBundles.length} bundle${
+      failedBundles.length === 1 ? "" : "s"
+    } could not be decoded.`;
+  }
+
+  return {
+    status: "ready",
+    message,
+    bundles,
+    meshesById,
+    bundleCount: bundles.length,
+    meshBundleCount,
+    meshCount,
+    failedBundles: failedBundles.length,
+  };
+}
+
+function collectCompressedBundleJsonSpecs(html) {
+  return extractCompressedBundleSpecs(html, compressedBundleJsonPattern, "bundle.json");
+}
+
+function collectCompressedBundleBlobSpecs(html) {
+  return extractCompressedBundleSpecs(html, compressedBundleBlobPattern, "data.blob");
+}
+
+function extractCompressedBundleSpecs(html, pattern, expectedFilename) {
+  pattern.lastIndex = 0;
+  const seen = new Set();
+  const specs = [];
+  let match;
+
+  while ((match = pattern.exec(html))) {
+    const path = parseJsStringLiteral(match[3]);
+    if (
+      typeof path !== "string" ||
+      !path.includes("/assets/bundles/") && !path.startsWith("assets/bundles/") ||
+      !path.endsWith(expectedFilename) ||
+      seen.has(path)
+    ) {
+      continue;
+    }
+
+    seen.add(path);
+    specs.push({
+      path,
+      payloadLiteral: match[1],
+      isBase122: parseEmbeddedCompressionFlag(match[2]),
+    });
+  }
+
+  return specs;
+}
+
+function parseEmbeddedCompressionFlag(value) {
+  return value === "true" || value === "!0";
+}
+
+function extractBrotliDecoder(html) {
+  const match = html.match(brotliDecoderPattern);
+  if (!match) {
+    throw new Error("This export does not expose Luna's embedded Brotli decoder helper.");
+  }
+
+  try {
+    const source = parseJsStringLiteral(match[1]);
+    const createDecoder = Function(`"use strict"; return (${source});`)();
+    const decoder = createDecoder();
+    if (typeof decoder !== "function") {
+      throw new Error("The extracted Brotli decoder did not initialize.");
+    }
+    return decoder;
+  } catch (error) {
+    throw new Error(`The Luna Brotli decoder could not be initialized. ${getErrorMessage(error)}`);
+  }
+}
+
+function parseJsStringLiteral(literal) {
+  return Function(`"use strict"; return (${literal});`)();
+}
+
+async function decodeCompressedTextAsset(payloadLiteral, isBase122, brotliDecoder) {
+  const bytes = await decodeCompressedBinaryAsset(
+    payloadLiteral,
+    isBase122,
+    brotliDecoder
+  );
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+async function decodeCompressedBinaryAsset(payloadLiteral, isBase122, brotliDecoder) {
+  const payload = parseJsStringLiteral(payloadLiteral);
+  const encodedBytes = isBase122
+    ? base122ToUint8Array(payload)
+    : base64ToUint8Array(payload);
+  const decodedBytes = await brotliDecoder(encodedBytes);
+  return decodedBytes instanceof Uint8Array
+    ? decodedBytes
+    : new Uint8Array(decodedBytes);
+}
+
+function base122ToUint8Array(strData) {
+  let curByte = 0;
+  let bitOfByte = 0;
+  let decodedIndex = 0;
+  const illegalCharacters = [0, 10, 13, 34, 38, 92];
+  const shortenedMarker = 0b111;
+  const maxOutputLength = (1.75 * strData.length) | 0;
+  const decoded = new Uint8Array(maxOutputLength);
+
+  function push7(byte) {
+    byte <<= 1;
+    curByte |= byte >>> bitOfByte;
+    bitOfByte += 7;
+    if (bitOfByte >= 8) {
+      decoded[decodedIndex++] = curByte;
+      bitOfByte -= 8;
+      curByte = (byte << (7 - bitOfByte)) & 255;
+    }
+  }
+
+  for (let index = 0; index < strData.length; index += 1) {
+    const code = strData.charCodeAt(index);
+    if (code > 127) {
+      const illegalIndex = (code >>> 8) & 7;
+      if (illegalIndex !== shortenedMarker) {
+        push7(illegalCharacters[illegalIndex]);
+      }
+      push7(code & 127);
+    } else {
+      push7(code);
+    }
+  }
+
+  return new Uint8Array(decoded.buffer, 0, decodedIndex);
+}
+
+function base64ToUint8Array(base64) {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function summarizeMeshBundle(bundlePath, bundleJson, options = {}) {
+  const assetCounts = Object.entries(bundleJson || {})
+    .map(([name, value]) => ({
+      name,
+      count: countBundleEntries(value),
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name));
+  const meshes = Array.isArray(bundleJson?.meshes)
+    ? bundleJson.meshes.map(summarizeMeshEntry)
+    : [];
+
+  const bundle = {
+    bundleId: getBundleIdFromPath(bundlePath),
+    bundlePath,
+    rawJson: options.rawJson || bundleJson || null,
+    rawBlobBytes:
+      options.rawBlobBytes instanceof Uint8Array ? options.rawBlobBytes : null,
+    dataBlobPath: options.dataBlobPath || getBundleDataBlobPath(bundlePath),
+    dataBlobByteLength:
+      typeof options.dataBlobByteLength === "number" ? options.dataBlobByteLength : null,
+    dataBlobError: options.dataBlobError || "",
+    assetCounts,
+    handlerCount: assetCounts.length,
+    meshes,
+    meshCount: meshes.length,
+  };
+
+  bundle.meshes.forEach((mesh) => {
+    mesh.bundle = bundle;
+  });
+
+  return bundle;
+}
+
+function countBundleEntries(value) {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).length;
+  }
+  return 0;
+}
+
+function summarizeMeshEntry(entry) {
+  const data = Array.isArray(entry?.data) ? entry.data : [];
+  const vertexBlobInfo = Array.isArray(data[6]) ? data[6] : [];
+  const subMeshRanges = Array.isArray(data[7]) ? data[7] : [];
+  const indexRangeStats = summarizeMeshIndexRanges(subMeshRanges);
+  const bounds = Array.isArray(data[4]) ? data[4] : [];
+  const channelLayout = Array.isArray(data[5]) ? data[5] : [];
+  const bindPoses = Array.isArray(data[8]) ? data[8] : [];
+  const blendShapes = Array.isArray(data[9]) ? data[9] : [];
+  const fallbackName = inferMeshName(entry?.path, entry?.id);
+
+  return {
+    id: String(entry?.id ?? ""),
+    rawEntry: entry || null,
+    name: typeof data[0] === "string" && data[0] ? data[0] : fallbackName,
+    path: entry?.path || "",
+    halfPrecision: typeof data[1] === "boolean" ? data[1] : null,
+    vertexCount: Number.isFinite(Number(data[3])) ? Number(data[3]) : null,
+    vertexBlobByteLength:
+      Number.isFinite(Number(vertexBlobInfo[1])) ? Number(vertexBlobInfo[1]) : null,
+    subMeshCount: subMeshRanges.length,
+    totalByteLength: indexRangeStats.maxEnd,
+    indexRangesSummary: indexRangeStats.summary,
+    boundsSummary: formatBounds(bounds),
+    channelCount: channelLayout.length,
+    bindPoseCount: bindPoses.length,
+    blendShapeCount: blendShapes.length,
+    rawDataLength: data.length,
+  };
+}
+
+function summarizeMeshIndexRanges(subMeshRanges) {
+  const ranges = [];
+
+  for (const group of subMeshRanges) {
+    if (!Array.isArray(group)) {
+      continue;
+    }
+    for (const range of group) {
+      if (
+        Array.isArray(range) &&
+        Number.isFinite(Number(range[0])) &&
+        Number.isFinite(Number(range[1]))
+      ) {
+        const offset = Number(range[0]);
+        const length = Number(range[1]);
+        ranges.push({
+          offset,
+          length,
+          end: offset + length,
+        });
+      }
+    }
+  }
+
+  if (!ranges.length) {
+    return {
+      summary: "",
+      maxEnd: null,
+    };
+  }
+
+  const summary = ranges
+    .slice(0, 3)
+    .map((range) => `${formatNumber(range.offset)}-${formatNumber(range.end)}`)
+    .join(", ");
+  const suffix = ranges.length > 3 ? ` +${ranges.length - 3} more` : "";
+
+  return {
+    summary: `${summary}${suffix}`,
+    maxEnd: Math.max(...ranges.map((range) => range.end)),
+  };
+}
+
+function inferMeshName(path, id) {
+  if (typeof path === "string" && path) {
+    const parts = path.split("/").filter(Boolean);
+    return parts[parts.length - 1] || `Mesh ${id ?? "?"}`;
+  }
+  return `Mesh ${id ?? "?"}`;
+}
+
+function getBundleIdFromPath(path) {
+  const match = String(path).match(/assets\/bundles\/([^/]+)\//);
+  return match ? match[1] : "?";
+}
+
+function getBundleDataBlobPath(bundlePath) {
+  return String(bundlePath).replace(/bundle\.json$/i, "data.blob");
+}
+
+function getVisibleMeshBundles(inspection, search) {
+  const bundles = inspection.bundles.filter((bundle) => bundle.meshCount > 0);
+  if (!search) {
+    return bundles;
+  }
+
+  return bundles
+    .map((bundle) => {
+      if (doesBundleMatchSearch(bundle, search)) {
+        return bundle;
+      }
+
+      const meshes = bundle.meshes.filter((mesh) => doesMeshMatchSearch(mesh, search));
+      if (!meshes.length) {
+        return null;
+      }
+
+      return {
+        ...bundle,
+        meshes,
+        meshCount: meshes.length,
+      };
+    })
+    .filter(Boolean);
+}
+
+function doesBundleMatchSearch(bundle, search) {
+  const haystack = [
+    bundle.bundleId,
+    bundle.bundlePath,
+    bundle.dataBlobPath,
+    ...bundle.assetCounts.map((entry) => `${entry.name} ${entry.count}`),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(search);
+}
+
+function doesMeshMatchSearch(mesh, search) {
+  const haystack = [
+    mesh.id,
+    mesh.name,
+    mesh.path,
+    mesh.vertexCount,
+    mesh.indexRangesSummary,
+    mesh.boundsSummary,
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(search);
+}
+
+function describeBundleAssetCounts(assetCounts) {
+  if (!assetCounts.length) {
+    return "No bundle handler counts were available.";
+  }
+
+  return assetCounts
+    .slice(0, 6)
+    .map((entry) => `${entry.name} ${formatNumber(entry.count)}`)
+    .join(", ");
+}
+
+function formatBounds(bounds) {
+  if (!Array.isArray(bounds) || bounds.length < 6) {
+    return "";
+  }
+
+  const values = bounds.slice(0, 6).map((value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(4).replace(/\.?0+$/, "") : String(value);
+  });
+
+  return `${values.slice(0, 3).join(", ")} -> ${values.slice(3, 6).join(", ")}`;
+}
+
+function formatNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString() : String(value);
+}
+
+function formatBytes(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    return "N/A";
+  }
+
+  if (number < 1024) {
+    return `${formatNumber(number)} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let current = number / 1024;
+  let unitIndex = 0;
+
+  while (current >= 1024 && unitIndex < units.length - 1) {
+    current /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${current.toFixed(current >= 10 ? 1 : 2).replace(/\.?0+$/, "")} ${
+    units[unitIndex]
+  }`;
+}
+
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function createNormalizedMeshReplacementPayload(rawEntry, rawBlobBytes) {
+  if (!rawEntry || !Array.isArray(rawEntry.data)) {
+    throw new Error("The donor mesh record is missing Luna mesh data.");
+  }
+
+  const sourceBytes = ensureUint8Array(rawBlobBytes);
+  if (!sourceBytes.byteLength) {
+    throw new Error("The donor Luna bundle did not expose readable mesh blob bytes.");
+  }
+
+  const normalizedEntry = deepClone(rawEntry);
+  const segments = [];
+  const normalizedMarkers = new Map();
+  let nextOffset = 0;
+
+  const normalizeMarker = (marker, label) => {
+    if (!isByteRangeMarker(marker)) {
+      throw new Error(`The donor mesh ${label} marker is not a valid [offset, length] pair.`);
+    }
+
+    const offset = Number(marker[0]);
+    const length = Number(marker[1]);
+    if (offset < 0 || length < 0 || offset + length > sourceBytes.byteLength) {
+      throw new Error(`The donor mesh ${label} marker points outside the bundle data blob.`);
+    }
+
+    const key = `${offset}:${length}`;
+    const existing = normalizedMarkers.get(key);
+    if (existing) {
+      return existing.slice();
+    }
+
+    const rebasedMarker = [nextOffset, length];
+    normalizedMarkers.set(key, rebasedMarker);
+    segments.push(sourceBytes.slice(offset, offset + length));
+    nextOffset += length;
+    return rebasedMarker.slice();
+  };
+
+  offsetMeshMarkers(normalizedEntry, 0, normalizeMarker);
+
+  return {
+    entry: normalizedEntry,
+    blobBytes: concatUint8Arrays(segments),
+  };
+}
+
+function buildModifiedMeshBundles() {
+  const overrideEntries = Object.entries(state.meshOverrides || {});
+  if (!overrideEntries.length) {
+    return [];
+  }
+
+  const overridesByBundlePath = new Map();
+
+  for (const [meshId, override] of overrideEntries) {
+    const targetMesh = state.bundleInspection.meshesById?.[meshId];
+    const bundle = targetMesh?.bundle;
+    if (!targetMesh || !bundle) {
+      throw new Error(`Mesh ${meshId} is no longer available for replacement.`);
+    }
+    if (!bundle.rawJson || !(bundle.rawBlobBytes instanceof Uint8Array)) {
+      throw new Error(`Bundle ${bundle.bundleId} is missing the raw Luna data needed for mesh replacement.`);
+    }
+    if (!override?.payload?.entry || !override?.payload?.blobBytes) {
+      throw new Error(`Mesh ${meshId} does not have a usable donor payload yet.`);
+    }
+
+    const entry = overridesByBundlePath.get(bundle.bundlePath) || {
+      bundle,
+      replacements: [],
+    };
+    entry.replacements.push({
+      meshId,
+      targetMesh,
+      override,
+    });
+    overridesByBundlePath.set(bundle.bundlePath, entry);
+  }
+
+  return Array.from(overridesByBundlePath.values()).map(({ bundle, replacements }) =>
+    applyMeshOverridesToBundle(bundle, replacements)
+  );
+}
+
+function applyMeshOverridesToBundle(bundle, replacements) {
+  const bundleJson = deepClone(bundle.rawJson);
+  const originalBlobBytes = ensureUint8Array(bundle.rawBlobBytes);
+  const blobParts = [originalBlobBytes];
+  let appendOffset = originalBlobBytes.byteLength;
+
+  if (!Array.isArray(bundleJson.meshes)) {
+    throw new Error(`Bundle ${bundle.bundleId} does not expose a Luna meshes array.`);
+  }
+
+  for (const replacement of replacements) {
+    const meshIndex = bundleJson.meshes.findIndex(
+      (entry) => String(entry?.id ?? "") === replacement.meshId
+    );
+    if (meshIndex < 0) {
+      throw new Error(`Mesh ${replacement.meshId} could not be found inside bundle ${bundle.bundleId}.`);
+    }
+
+    const targetEntry = bundleJson.meshes[meshIndex];
+    const payloadBytes = ensureUint8Array(replacement.override.payload.blobBytes);
+    const replacementEntry = cloneMeshEntryWithOffset(
+      replacement.override.payload.entry,
+      appendOffset
+    );
+
+    replacementEntry.id = targetEntry.id;
+    replacementEntry.assetBundleId = targetEntry.assetBundleId;
+    replacementEntry.path = targetEntry.path || replacementEntry.path;
+    if (
+      Array.isArray(targetEntry.data) &&
+      Array.isArray(replacementEntry.data) &&
+      typeof targetEntry.data[0] === "string" &&
+      targetEntry.data[0]
+    ) {
+      replacementEntry.data[0] = targetEntry.data[0];
+    }
+
+    bundleJson.meshes[meshIndex] = replacementEntry;
+    blobParts.push(payloadBytes);
+    appendOffset += payloadBytes.byteLength;
+  }
+
+  return {
+    bundleJsonPath: bundle.bundlePath,
+    bundleBlobPath: bundle.dataBlobPath,
+    jsonText: JSON.stringify(bundleJson),
+    blobBytes: concatUint8Arrays(blobParts),
+  };
+}
+
+function cloneMeshEntryWithOffset(entry, baseOffset) {
+  const clonedEntry = deepClone(entry);
+  offsetMeshMarkers(clonedEntry, baseOffset);
+  return clonedEntry;
+}
+
+function offsetMeshMarkers(entry, baseOffset, markerTransform) {
+  const data = Array.isArray(entry?.data) ? entry.data : null;
+  if (!data) {
+    throw new Error("The Luna mesh entry is missing its data payload.");
+  }
+
+  const transformMarker =
+    typeof markerTransform === "function"
+      ? markerTransform
+      : (marker) => offsetByteRangeMarker(marker, baseOffset);
+
+  if (isByteRangeMarker(data[6])) {
+    data[6] = transformMarker(data[6], "vertices");
+  } else {
+    throw new Error("The Luna mesh entry is missing its vertex blob marker.");
+  }
+
+  const subMeshes = Array.isArray(data[7]) ? data[7] : [];
+  for (const subMesh of subMeshes) {
+    if (!Array.isArray(subMesh)) {
+      continue;
+    }
+    for (let index = 0; index < subMesh.length; index += 1) {
+      if (isByteRangeMarker(subMesh[index])) {
+        subMesh[index] = transformMarker(subMesh[index], "sub-mesh");
+      }
+    }
+  }
+
+  const blendShapes = Array.isArray(data[9]) ? data[9] : [];
+  for (const blendShape of blendShapes) {
+    const frames = Array.isArray(blendShape) ? blendShape[1] : null;
+    if (!Array.isArray(frames)) {
+      continue;
+    }
+    for (const frame of frames) {
+      if (!Array.isArray(frame)) {
+        continue;
+      }
+      for (let index = 1; index <= 3; index += 1) {
+        if (isByteRangeMarker(frame[index])) {
+          frame[index] = transformMarker(frame[index], "blend-shape");
+        }
+      }
+    }
+  }
+}
+
+function offsetByteRangeMarker(marker, baseOffset) {
+  if (!isByteRangeMarker(marker)) {
+    throw new Error("A mesh blob marker is not a valid [offset, length] pair.");
+  }
+
+  return [Number(marker[0]) + baseOffset, Number(marker[1])];
+}
+
+function isByteRangeMarker(value) {
+  return (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    Number.isFinite(Number(value[0])) &&
+    Number.isFinite(Number(value[1]))
+  );
+}
+
+function ensureUint8Array(value) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (isArrayBufferLike(value)) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return new Uint8Array(0);
+}
+
+function concatUint8Arrays(parts) {
+  const normalizedParts = parts
+    .map(ensureUint8Array)
+    .filter((part) => part.byteLength > 0);
+  const totalLength = normalizedParts.reduce((total, part) => total + part.byteLength, 0);
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+
+  for (const part of normalizedParts) {
+    merged.set(part, offset);
+    offset += part.byteLength;
+  }
+
+  return merged;
+}
+
+function injectMeshOverrideScript(html) {
+  const patches = buildModifiedMeshBundles();
+  if (!patches.length) {
+    return html;
+  }
+
+  const cleanedHtml = html.replace(meshOverrideScriptPattern, "");
+  const overrideScript = serializeMeshBundleOverrideScript(patches);
+
+  if (cleanedHtml.includes("</body>")) {
+    return cleanedHtml.replace("</body>", `${overrideScript}</body>`);
+  }
+
+  return `${cleanedHtml}${overrideScript}`;
+}
+
+function serializeMeshBundleOverrideScript(patches) {
+  const payload = patches.map((patch) => ({
+    bundleJsonPath: patch.bundleJsonPath,
+    bundleBlobPath: patch.bundleBlobPath,
+    jsonBase64: textToBase64(patch.jsonText),
+    blobBase64: arrayBufferToBase64(patch.blobBytes),
+  }));
+
+  return `<script data-luna-mesh-overrides>!function(){const patches=${JSON.stringify(
+    payload
+  )};function base64ToBytes(value){const binary=window.atob(value);const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index+=1){bytes[index]=binary.charCodeAt(index)}return bytes}function base64ToText(value){return new TextDecoder("utf-8").decode(base64ToBytes(value))}window.jsons=window.jsons||{};window.blobs=window.blobs||{};window._compressedAssets=window._compressedAssets||[];const priorAssets=window._compressedAssets.slice();const patchPromise=Promise.all(priorAssets).then(function(){for(const patch of patches){window.jsons[patch.bundleJsonPath]=JSON.parse(base64ToText(patch.jsonBase64));window.blobs[patch.bundleBlobPath]=base64ToBytes(patch.blobBase64).buffer}});window._compressedAssets.push(patchPromise)}();</script>`;
+}
+
+function textToBase64(value) {
+  return arrayBufferToBase64(new TextEncoder().encode(value));
+}
+
+function arrayBufferToBase64(value) {
+  const bytes = ensureUint8Array(value);
+  let binary = "";
+  const chunkSize = 32768;
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return window.btoa(binary);
+}
+
 function buildPatchedHtml() {
   if (!state.model || !state.originalHtml) {
     return "";
@@ -1900,6 +3983,7 @@ function buildPatchedHtml() {
     `$1${escapeAttribute(state.model.preloader.icon)}$3`
   );
   html = patchEmbeddedAssetSources(html);
+  html = injectMeshOverrideScript(html);
   return html;
 }
 
@@ -2221,6 +4305,9 @@ function getChangeCount() {
     JSON.stringify(state.originalModel.playgroundAssetOverrides)
   ) {
     changes += 1;
+  }
+  if (Object.keys(state.meshOverrides || {}).length) {
+    changes += Object.keys(state.meshOverrides).length;
   }
   if (
     JSON.stringify(state.model.playgroundFiltersOverrides) !==
