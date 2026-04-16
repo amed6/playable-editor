@@ -451,8 +451,10 @@ function renderPackageConfigSection() {
     return "";
   }
 
+  const open = search ? "open" : "";
+
   return `
-    <details class="section-card" open>
+    <details class="section-card" ${open}>
       <summary>
         <div class="section-title">
           <div>
@@ -535,8 +537,10 @@ function renderPreloaderSection() {
     return "";
   }
 
+  const open = search ? "open" : "";
+
   return `
-    <details class="section-card" open>
+    <details class="section-card" ${open}>
       <summary>
         <div class="section-title">
           <div>
@@ -639,8 +643,10 @@ function renderAssetsSection() {
     return "";
   }
 
+  const open = search ? "open" : "";
+
   return `
-    <details class="section-card" ${assetEntries.length ? "" : "open"}>
+    <details class="section-card" ${open}>
       <summary>
         <div class="section-title">
           <div>
@@ -711,8 +717,10 @@ function renderAdvancedSection() {
     return "";
   }
 
+  const open = search ? "open" : "";
+
   return `
-    <details class="section-card">
+    <details class="section-card" ${open}>
       <summary>
         <div class="section-title">
           <div>
@@ -790,7 +798,7 @@ function renderPlayableGroups() {
 
   return filteredGroups
     .map(({ groupName, fields }, index) => {
-      const open = state.search || index === 0 ? "open" : "";
+      const open = state.search ? "open" : "";
       return `
         <details class="section-card" ${open}>
           <summary class="group-summary">
