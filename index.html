@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Luna Playable Editor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div class="hero__copy">
+          <p class="eyebrow">Client-side Luna Export Editor</p>
+          <h1>Luna playables, editable in one place.</h1>
+          <p class="hero__lede">
+            Upload a Luna-downloaded HTML export, edit typed fields, tweak JSON
+            safely, preview changes with auto reload, and download a patched
+            file without touching the ad-network wrapper code.
+          </p>
+        </div>
+
+        <div class="hero__actions">
+          <label class="button button--primary file-button">
+            <input id="fileInput" type="file" accept=".html,text/html" />
+            <span>Upload Luna HTML</span>
+          </label>
+          <button id="downloadBtn" class="button button--accent" disabled>
+            Download Edited HTML
+          </button>
+          <button id="resetBtn" class="button button--ghost" disabled>
+            Reset Changes
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="editor-pane">
+          <div id="dropZone" class="dropzone">
+            <div>
+              <p class="dropzone__title">Drop a Luna export here</p>
+              <p class="dropzone__body">
+                Supports trusted Luna-downloaded single-file HTML exports.
+              </p>
+            </div>
+            <div class="dropzone__meta" id="fileMeta">
+              No file loaded yet
+            </div>
+          </div>
+
+          <div id="statusBanner" class="status-banner status-banner--idle">
+            Upload a Luna-downloaded HTML export to begin.
+          </div>
+
+          <div class="summary-grid" id="summaryGrid">
+            <article class="summary-card">
+              <span class="summary-card__label">Groups</span>
+              <strong id="metricGroups">0</strong>
+            </article>
+            <article class="summary-card">
+              <span class="summary-card__label">Fields</span>
+              <strong id="metricFields">0</strong>
+            </article>
+            <article class="summary-card">
+              <span class="summary-card__label">Assets</span>
+              <strong id="metricAssets">0</strong>
+            </article>
+            <article class="summary-card">
+              <span class="summary-card__label">Changes</span>
+              <strong id="metricChanges">0</strong>
+            </article>
+          </div>
+
+          <div class="toolbar">
+            <label class="search-field">
+              <span>Search fields</span>
+              <input
+                id="searchInput"
+                type="search"
+                placeholder="Search groups, fields, JSON, assets..."
+                disabled
+              />
+            </label>
+            <div class="toolbar__note">
+              Preview reloads automatically after valid edits.
+            </div>
+          </div>
+
+          <div id="editorSections" class="editor-sections">
+            <div class="empty-state">
+              <h2>No export loaded</h2>
+              <p>
+                Once a file is uploaded, the editor will extract Luna override
+                data, preloader values, and package config fields here.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="preview-pane">
+          <div class="preview-header">
+            <div>
+              <p class="eyebrow">Live Preview</p>
+              <h2 id="previewTitle">Awaiting export</h2>
+            </div>
+            <div class="preview-header__meta">
+              <div class="segmented" role="group" aria-label="Preview orientation">
+                <button
+                  id="previewViewportAuto"
+                  class="segmented__button"
+                  type="button"
+                  data-action="preview-viewport"
+                  data-viewport="auto"
+                >
+                  Auto
+                </button>
+                <button
+                  id="previewViewportPortrait"
+                  class="segmented__button"
+                  type="button"
+                  data-action="preview-viewport"
+                  data-viewport="portrait"
+                >
+                  Portrait
+                </button>
+                <button
+                  id="previewViewportLandscape"
+                  class="segmented__button"
+                  type="button"
+                  data-action="preview-viewport"
+                  data-viewport="landscape"
+                >
+                  Landscape
+                </button>
+              </div>
+              <span class="pill" id="previewStatus">Idle</span>
+            </div>
+          </div>
+
+          <div class="preview-frame-wrap">
+            <div id="previewStage" class="preview-stage preview-stage--portrait">
+              <iframe
+                id="previewFrame"
+                title="Playable preview"
+                sandbox="allow-scripts allow-pointer-lock allow-popups allow-same-origin"
+              ></iframe>
+              <div
+                id="previewInputOverlay"
+                class="preview-input-overlay"
+                hidden
+                aria-hidden="true"
+              ></div>
+              <div id="previewPlaceholder" class="preview-placeholder">
+                <p>Preview appears here after upload.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="jsonModal" class="json-modal">
+      <form method="dialog" class="json-modal__surface">
+        <header class="json-modal__header">
+          <div>
+            <p class="eyebrow" id="jsonModalEyebrow">Editor</p>
+            <h2 id="jsonModalTitle">Edit value</h2>
+          </div>
+          <button
+            id="jsonModalClose"
+            class="icon-button"
+            type="button"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </header>
+
+        <label class="json-modal__field">
+          <span id="jsonModalHint">Make your edits and apply them.</span>
+          <textarea id="jsonModalTextarea" spellcheck="false"></textarea>
+        </label>
+
+        <div class="json-modal__footer">
+          <div class="json-modal__status" id="jsonModalStatus">
+            Validation ready.
+          </div>
+          <div class="json-modal__actions">
+            <button id="jsonFormatBtn" class="button button--ghost" type="button">
+              Format
+            </button>
+            <button id="jsonApplyBtn" class="button button--primary" type="button">
+              Apply
+            </button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>
