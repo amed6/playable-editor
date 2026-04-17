@@ -15,7 +15,8 @@
           <p class="hero__lede">
             Upload a Luna-downloaded HTML export, edit typed fields, tweak JSON
             safely, preview changes with auto reload, and download a patched
-            file without touching the ad-network wrapper code.
+            file with lightweight AppLovin, IronSource, and UnityAds wrapper
+            variants when needed.
           </p>
         </div>
 
@@ -27,6 +28,24 @@
           <button id="downloadBtn" class="button button--accent" disabled>
             Download Edited HTML
           </button>
+          <div class="export-targets" aria-label="Download targets">
+            <div class="export-targets__header">
+              <span>Download targets</span>
+              <span class="export-targets__hint">Easy wrapper variants only</span>
+            </div>
+            <label class="target-chip">
+              <input id="networkApplovin" type="checkbox" checked />
+              <span>AppLovin</span>
+            </label>
+            <label class="target-chip">
+              <input id="networkIronsource" type="checkbox" checked />
+              <span>IronSource</span>
+            </label>
+            <label class="target-chip">
+              <input id="networkUnityads" type="checkbox" checked />
+              <span>UnityAds</span>
+            </label>
+          </div>
           <button id="resetBtn" class="button button--ghost" disabled>
             Reset Changes
           </button>

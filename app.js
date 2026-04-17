@@ -31,6 +31,9 @@ const elements = {
   dropZone: document.getElementById("dropZone"),
   fileMeta: document.getElementById("fileMeta"),
   downloadBtn: document.getElementById("downloadBtn"),
+  networkApplovin: document.getElementById("networkApplovin"),
+  networkIronsource: document.getElementById("networkIronsource"),
+  networkUnityads: document.getElementById("networkUnityads"),
   resetBtn: document.getElementById("resetBtn"),
   searchInput: document.getElementById("searchInput"),
   editorSections: document.getElementById("editorSections"),
@@ -78,6 +81,33 @@ const compressedBundleBlobPattern =
   /decompressArrayBuffer\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*,\s*(true|false|!0|!1)\s*\)\.then\(\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*\)\s*\{\s*window\.blobs\[\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*\]\s*=\s*[A-Za-z_$][\w$]*\s*;?\s*\}\s*\)\s*;?/g;
 const brotliDecoderPattern =
   /window\.makeBrotliDecodeStr\s*=\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/;
+const downloadTargetDefinitions = [
+  {
+    key: "applovin",
+    label: "AppLovin",
+    elementKey: "networkApplovin",
+  },
+  {
+    key: "ironsource",
+    label: "IronSource",
+    elementKey: "networkIronsource",
+  },
+  {
+    key: "unityads",
+    label: "UnityAds",
+    elementKey: "networkUnityads",
+  },
+];
+const targetPlatformPattern = /targetPlatform:\s*("[^"]*"|'[^']*')/;
+const scriptBlockPattern = /<script\b[^>]*>[\s\S]*?<\/script>/g;
+const piApplyScriptBlockMatcher = /window\.pi\.apply\s*\(\s*window\s*,/;
+const piApplySettingsPattern =
+  /window\.pi\.apply\s*\(\s*window\s*,\s*(\[[\s\S]*?\])(?:\s*\|\|\s*\[\s*\])?\s*\)/;
+const piInjectAdDataScriptMatcher = /window\.pi\.injectAdData/;
+const piLogEventPatchScriptMatcher =
+  /window\.pi\.originalLogEvent\s*=\s*window\.pi\.logEvent/;
+const appLovinAnalyticsScriptMatcher = /APPLOVIN_ANALYTICS_EVENTS/;
+const installFullGameScriptMatcher = /Luna\.Unity\.Playable\.InstallFullGame/;
 const previewHelperScript = `<script>
 !function(){
   if(window.__LUNA_EDITOR_PREVIEW_HELPER__)return;
@@ -190,6 +220,12 @@ setupPreviewStageObserver();
 renderApp();
 
 function bindEvents() {
+  for (const input of getDownloadTargetInputs()) {
+    input.addEventListener("change", () => {
+      renderApp();
+    });
+  }
+
   elements.fileInput.addEventListener("change", async (event) => {
     const [file] = event.target.files || [];
     if (file) {
@@ -224,28 +260,34 @@ function bindEvents() {
       return;
     }
 
+    const selectedTargets = getSelectedDownloadTargets();
+    if (!selectedTargets.length) {
+      state.status = {
+        kind: "error",
+        message: "Pick at least one download target before exporting.",
+      };
+      updateStatusBanner();
+      renderApp();
+      return;
+    }
+
     elements.downloadBtn.disabled = true;
 
     try {
       const exportResult = await buildDownloadHtml();
-      const blob = new Blob([exportResult.html], { type: "text/html" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = getDownloadName(state.filename);
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      const downloadItems = buildDownloadExports(exportResult.html, selectedTargets);
+
+      for (let index = 0; index < downloadItems.length; index += 1) {
+        const item = downloadItems[index];
+        downloadHtmlFile(item.filename, item.html);
+        if (index < downloadItems.length - 1) {
+          await wait(140);
+        }
+      }
 
       state.status = {
         kind: "ready",
-        message:
-          exportResult.mode === "embedded-rebuild"
-            ? "Downloaded a compact mesh export with the original Luna mesh bundle rebuilt in-place."
-            : exportResult.mode === "runtime-patch"
-              ? `Downloaded the edited HTML with the runtime mesh patch fallback. ${exportResult.fallbackReason}`
-              : "Downloaded the edited HTML.",
+        message: buildDownloadStatusMessage(downloadItems, exportResult),
       };
       updateStatusBanner();
     } catch (error) {
@@ -453,11 +495,47 @@ function parsePackageConfig(literal) {
   }
 }
 
+function getDownloadTargetInputs() {
+  return downloadTargetDefinitions
+    .map((definition) => elements[definition.elementKey])
+    .filter(Boolean);
+}
+
+function getSelectedDownloadTargets() {
+  return downloadTargetDefinitions
+    .filter((definition) => elements[definition.elementKey]?.checked)
+    .map((definition) => definition.key);
+}
+
+function getDownloadTargetLabel(network) {
+  return (
+    downloadTargetDefinitions.find((definition) => definition.key === network)?.label ||
+    network
+  );
+}
+
+function getDownloadButtonLabel(selectedCount) {
+  if (selectedCount > 1) {
+    return `Download ${selectedCount} HTML Files`;
+  }
+  if (selectedCount === 1) {
+    return "Download Edited HTML";
+  }
+  return "Select Download Targets";
+}
+
 function renderApp() {
   const loaded = Boolean(state.model);
-  elements.downloadBtn.disabled = !loaded;
+  const selectedTargets = getSelectedDownloadTargets();
+  elements.downloadBtn.disabled = !loaded || !selectedTargets.length;
+  elements.downloadBtn.textContent = loaded
+    ? getDownloadButtonLabel(selectedTargets.length)
+    : "Download Edited HTML";
   elements.resetBtn.disabled = !loaded;
   elements.searchInput.disabled = !loaded;
+  for (const input of getDownloadTargetInputs()) {
+    input.disabled = !loaded;
+  }
   elements.searchInput.value = state.search;
   elements.fileMeta.textContent = loaded
     ? `${state.filename} loaded`
@@ -4384,6 +4462,249 @@ async function buildDownloadHtml() {
   }
 }
 
+function buildDownloadExports(baseHtml, selectedTargets) {
+  const targets = selectedTargets?.length ? selectedTargets : getSelectedDownloadTargets();
+
+  if (!targets.length) {
+    throw new Error("Pick at least one download target before exporting.");
+  }
+
+  return targets.map((network) => ({
+    network,
+    label: getDownloadTargetLabel(network),
+    filename: getDownloadName(state.filename, network),
+    html: buildNetworkVariantHtml(baseHtml, network),
+  }));
+}
+
+function buildNetworkVariantHtml(html, network) {
+  let nextHtml = patchTargetPlatform(html, network);
+  nextHtml = patchPiApplyScript(nextHtml, network);
+  nextHtml = removeOptionalScriptBlock(nextHtml, piInjectAdDataScriptMatcher);
+  nextHtml = removeOptionalScriptBlock(nextHtml, piLogEventPatchScriptMatcher);
+
+  if (network === "applovin") {
+    nextHtml = removeOptionalScriptBlock(nextHtml, appLovinAnalyticsScriptMatcher);
+    nextHtml = upsertScriptBeforeBody(
+      nextHtml,
+      buildAppLovinAnalyticsScript(),
+      appLovinAnalyticsScriptMatcher
+    );
+    return nextHtml;
+  }
+
+  nextHtml = removeOptionalScriptBlock(nextHtml, appLovinAnalyticsScriptMatcher);
+  nextHtml = upsertScriptBeforeAnchor(
+    nextHtml,
+    buildPiInjectAdDataScript(network),
+    piInjectAdDataScriptMatcher
+  );
+  nextHtml = upsertScriptBeforeAnchor(
+    nextHtml,
+    buildPiLogEventPatchScript(),
+    piLogEventPatchScriptMatcher
+  );
+
+  return nextHtml;
+}
+
+function patchTargetPlatform(html, network) {
+  return replaceOnce(html, targetPlatformPattern, `targetPlatform:${JSON.stringify(network)}`);
+}
+
+function patchPiApplyScript(html, network) {
+  const piApplyScript = findScriptBlock(html, piApplyScriptBlockMatcher);
+
+  if (!piApplyScript) {
+    throw new Error(
+      "The Playable Insights bootstrap could not be found while building the network variant."
+    );
+  }
+
+  const settings = buildPiSettings(piApplyScript, network);
+  const script = buildInlineScript(
+    `window.pi.apply(window,${JSON.stringify(settings)}||[]);`,
+    "pi-apply"
+  );
+
+  return replaceScriptBlock(
+    html,
+    piApplyScriptBlockMatcher,
+    script,
+    "The Playable Insights bootstrap could not be found while building the network variant."
+  );
+}
+
+function buildPiSettings(piApplyScript, network) {
+  const settingsLiteral = piApplyScript.match(piApplySettingsPattern)?.[1];
+
+  if (!settingsLiteral) {
+    return [network];
+  }
+
+  try {
+    const parsed = JSON.parse(settingsLiteral);
+    if (!Array.isArray(parsed) || !parsed.length) {
+      return [network];
+    }
+
+    parsed[0] = network;
+    return parsed;
+  } catch (error) {
+    console.warn("Could not preserve Playable Insights settings, falling back to ad-network only.", error);
+    return [network];
+  }
+}
+
+function buildPiInjectAdDataScript(network) {
+  const body =
+    network === "ironsource"
+      ? `window.pi.injectAdData=function(){if(this.env.impressionId)return;try{const adData=\"undefined\"!=typeof window.mraid&&window.mraid&&window.mraid.getMraidAdData?window.mraid.getMraidAdData():window.dapi&&\"function\"==typeof window.dapi.getAdData?window.dapi.getAdData():null;if(!adData)return;this.env.impressionId=adData.UII;this.env.creativeId=adData.creativeId||\"\";this.env.campaignId=adData.campaignId||\"\";\"RewardedVideo\"===adData.productType?this.env.isRewarded=1:\"Interstitial\"===adData.productType&&(this.env.isRewarded=0)}catch(error){console.warn(\"Playable Insights ad data injection skipped.\",error)}};`
+      : `window.pi.injectAdData=function(){if(this.env.impressionId)return;try{const adData=\"undefined\"!=typeof window.mraid&&window.mraid&&window.mraid.getMraidAdData?window.mraid.getMraidAdData():window.dapi&&\"function\"==typeof window.dapi.getAdData?window.dapi.getAdData():null;if(!adData)return;this.env.impressionId=adData.UII;this.env.creativeId=adData.creativeId||\"\";this.env.campaignId=adData.campaignId||\"\"}catch(error){console.warn(\"Playable Insights ad data injection skipped.\",error)}};`;
+
+  return buildInlineScript(body, "pi-inject-ad-data");
+}
+
+function buildPiLogEventPatchScript() {
+  return buildInlineScript(
+    `window.pi.originalLogEvent=window.pi.logEvent,window.pi.logEvent=function(eventName,resetTimestamp,options){return\"function\"==typeof this.injectAdData&&this.injectAdData(),this.originalLogEvent(eventName,resetTimestamp,options)};`,
+    "pi-log-event"
+  );
+}
+
+function buildAppLovinAnalyticsScript() {
+  return buildInlineScript(
+    `!function(){let width=window.innerWidth,height=window.innerHeight;window.addEventListener("resize",function(){width=window.innerWidth,height=window.innerHeight}),setInterval(function(){(width!==window.innerWidth||height!==window.innerHeight)&&(window.dispatchEvent(new Event("resize")),width=window.innerWidth,height=window.innerHeight)},300),window.APPLOVIN_ANALYTICS_EVENTS={LOADING:"LOADING",LOADED:"LOADED",DISPLAYED:"DISPLAYED",CTA_CLICKED:"CTA_CLICKED",ENDCARD_SHOWN:"ENDCARD_SHOWN",CHALLENGE_STARTED:"CHALLENGE_STARTED",CHALLENGE_FAILED:"CHALLENGE_FAILED",CHALLENGE_RETRY:"CHALLENGE_RETRY",CHALLENGE_PASS_25:"CHALLENGE_PASS_25",CHALLENGE_PASS_50:"CHALLENGE_PASS_50",CHALLENGE_PASS_75:"CHALLENGE_PASS_75",CHALLENGE_SOLVED:"CHALLENGE_SOLVED"},window.callAnalyticsEvent=function(eventName){void 0!==window.ALPlayableAnalytics&&window.ALPlayableAnalytics&&window.ALPlayableAnalytics.trackEvent&&window.ALPlayableAnalytics.trackEvent(eventName)},window.addEventListener("luna:start",function(){window.callAnalyticsEvent(window.APPLOVIN_ANALYTICS_EVENTS.LOADING)}),window.addEventListener("luna:started",function(){window.callAnalyticsEvent(window.APPLOVIN_ANALYTICS_EVENTS.LOADED)}),window.addEventListener("luna:postrender",function(){window.callAnalyticsEvent(window.APPLOVIN_ANALYTICS_EVENTS.DISPLAYED)}),window.addEventListener("luna:starting",function(){"function"==typeof window.audioVolumeToggle&&window.audioVolumeToggle(!0)}),window.addEventListener("luna:unmute",function(){"function"==typeof window.audioVolumeToggle&&window.audioVolumeToggle(!1)}),window.addEventListener("luna:unsafe:unmute",function(){window.dispatchEvent(new Event("luna:unmute"))})}();`,
+    "applovin-analytics"
+  );
+}
+
+function buildInlineScript(content, marker) {
+  const markerAttribute = marker
+    ? ` data-luna-network-patch="${escapeAttribute(marker)}"`
+    : "";
+  return `<script${markerAttribute}>${content}</script>`;
+}
+
+function removeOptionalScriptBlock(source, matcher) {
+  return source.replace(scriptBlockPattern, (block) =>
+    matchesScriptBlock(block, matcher) ? "" : block
+  );
+}
+
+function upsertScriptBeforeAnchor(source, scriptMarkup, existingMatcher) {
+  const withoutExisting = removeOptionalScriptBlock(source, existingMatcher);
+  let inserted = false;
+  const nextHtml = withoutExisting.replace(scriptBlockPattern, (block) => {
+    if (!inserted && matchesScriptBlock(block, installFullGameScriptMatcher)) {
+      inserted = true;
+      return `${scriptMarkup}${block}`;
+    }
+    return block;
+  });
+
+  return inserted ? nextHtml : upsertScriptBeforeBody(withoutExisting, scriptMarkup);
+}
+
+function upsertScriptBeforeBody(source, scriptMarkup, existingMatcher) {
+  const withoutExisting = existingMatcher
+    ? removeOptionalScriptBlock(source, existingMatcher)
+    : source;
+
+  if (withoutExisting.includes("</body>")) {
+    return withoutExisting.replace("</body>", `${scriptMarkup}</body>`);
+  }
+
+  return `${withoutExisting}${scriptMarkup}`;
+}
+
+function matchesScriptBlock(block, matcher) {
+  if (!matcher) {
+    return false;
+  }
+
+  matcher.lastIndex = 0;
+  return matcher.test(block);
+}
+
+function findScriptBlock(source, matcher) {
+  const blocks = source.match(scriptBlockPattern) || [];
+  for (const block of blocks) {
+    if (matchesScriptBlock(block, matcher)) {
+      return block;
+    }
+  }
+  return "";
+}
+
+function replaceScriptBlock(source, matcher, replacement, errorMessage) {
+  let replaced = false;
+  const nextHtml = source.replace(scriptBlockPattern, (block) => {
+    if (!replaced && matchesScriptBlock(block, matcher)) {
+      replaced = true;
+      return replacement;
+    }
+    return block;
+  });
+
+  if (!replaced) {
+    throw new Error(
+      errorMessage || "A required Luna script block could not be found while rebuilding the file."
+    );
+  }
+
+  return nextHtml;
+}
+
+function downloadHtmlFile(filename, html) {
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function buildDownloadStatusMessage(downloadItems, exportResult) {
+  const labels = formatNetworkLabelList(downloadItems.map((item) => item.label));
+  const downloadMessage =
+    downloadItems.length === 1
+      ? `Downloaded the edited ${labels} HTML.`
+      : `Started downloads for ${labels}. Your browser may ask to allow multiple downloads.`;
+
+  if (exportResult.mode === "embedded-rebuild") {
+    return `${downloadMessage} Mesh bundles were rebuilt in-place.`;
+  }
+
+  if (exportResult.mode === "runtime-patch") {
+    return `${downloadMessage} Runtime mesh patch fallback was used. ${exportResult.fallbackReason}`;
+  }
+
+  return downloadMessage;
+}
+
+function formatNetworkLabelList(labels) {
+  if (!labels.length) {
+    return "HTML";
+  }
+  if (labels.length === 1) {
+    return labels[0];
+  }
+  if (labels.length === 2) {
+    return `${labels[0]} and ${labels[1]}`;
+  }
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
 function describeMeshExportFallbackReason(error) {
   const message = getErrorMessage(error);
 
@@ -4766,16 +5087,21 @@ function getChangeCount() {
   return changes;
 }
 
-function getDownloadName(filename) {
+function getDownloadName(filename, network) {
   if (!filename) {
-    return "luna-edited.html";
+    return network ? `luna-${network}-edited.html` : "luna-edited.html";
   }
 
-  if (filename.toLowerCase().endsWith(".html")) {
-    return filename.replace(/\.html$/i, "-edited.html");
+  const withoutExtension = filename.replace(/\.html$/i, "");
+  const normalizedBase = withoutExtension
+    .replace(/-edited$/i, "")
+    .replace(/(?:_|-)(applovin|ironsource|unityads)$/i, "");
+
+  if (network) {
+    return `${normalizedBase}_${network}-edited.html`;
   }
 
-  return `${filename}-edited.html`;
+  return `${normalizedBase}-edited.html`;
 }
 
 function renderAssetPreview(src, alt, mediaType = "asset") {
