@@ -3717,6 +3717,7 @@ function buildModifiedMeshBundles() {
     return [];
   }
 
+  // Group replacement payloads by bundle so export only carries the mesh deltas.
   const overridesByBundlePath = new Map();
 
   for (const [meshId, override] of overrideEntries) {
@@ -3725,84 +3726,24 @@ function buildModifiedMeshBundles() {
     if (!targetMesh || !bundle) {
       throw new Error(`Mesh ${meshId} is no longer available for replacement.`);
     }
-    if (!bundle.rawJson || !(bundle.rawBlobBytes instanceof Uint8Array)) {
-      throw new Error(`Bundle ${bundle.bundleId} is missing the raw Luna data needed for mesh replacement.`);
-    }
     if (!override?.payload?.entry || !override?.payload?.blobBytes) {
       throw new Error(`Mesh ${meshId} does not have a usable donor payload yet.`);
     }
 
     const entry = overridesByBundlePath.get(bundle.bundlePath) || {
-      bundle,
+      bundleJsonPath: bundle.bundlePath,
+      bundleBlobPath: bundle.dataBlobPath,
       replacements: [],
     };
     entry.replacements.push({
       meshId,
-      targetMesh,
-      override,
+      entry: deepClone(override.payload.entry),
+      blobBytes: ensureUint8Array(override.payload.blobBytes),
     });
     overridesByBundlePath.set(bundle.bundlePath, entry);
   }
 
-  return Array.from(overridesByBundlePath.values()).map(({ bundle, replacements }) =>
-    applyMeshOverridesToBundle(bundle, replacements)
-  );
-}
-
-function applyMeshOverridesToBundle(bundle, replacements) {
-  const bundleJson = deepClone(bundle.rawJson);
-  const originalBlobBytes = ensureUint8Array(bundle.rawBlobBytes);
-  const blobParts = [originalBlobBytes];
-  let appendOffset = originalBlobBytes.byteLength;
-
-  if (!Array.isArray(bundleJson.meshes)) {
-    throw new Error(`Bundle ${bundle.bundleId} does not expose a Luna meshes array.`);
-  }
-
-  for (const replacement of replacements) {
-    const meshIndex = bundleJson.meshes.findIndex(
-      (entry) => String(entry?.id ?? "") === replacement.meshId
-    );
-    if (meshIndex < 0) {
-      throw new Error(`Mesh ${replacement.meshId} could not be found inside bundle ${bundle.bundleId}.`);
-    }
-
-    const targetEntry = bundleJson.meshes[meshIndex];
-    const payloadBytes = ensureUint8Array(replacement.override.payload.blobBytes);
-    const replacementEntry = cloneMeshEntryWithOffset(
-      replacement.override.payload.entry,
-      appendOffset
-    );
-
-    replacementEntry.id = targetEntry.id;
-    replacementEntry.assetBundleId = targetEntry.assetBundleId;
-    replacementEntry.path = targetEntry.path || replacementEntry.path;
-    if (
-      Array.isArray(targetEntry.data) &&
-      Array.isArray(replacementEntry.data) &&
-      typeof targetEntry.data[0] === "string" &&
-      targetEntry.data[0]
-    ) {
-      replacementEntry.data[0] = targetEntry.data[0];
-    }
-
-    bundleJson.meshes[meshIndex] = replacementEntry;
-    blobParts.push(payloadBytes);
-    appendOffset += payloadBytes.byteLength;
-  }
-
-  return {
-    bundleJsonPath: bundle.bundlePath,
-    bundleBlobPath: bundle.dataBlobPath,
-    jsonText: JSON.stringify(bundleJson),
-    blobBytes: concatUint8Arrays(blobParts),
-  };
-}
-
-function cloneMeshEntryWithOffset(entry, baseOffset) {
-  const clonedEntry = deepClone(entry);
-  offsetMeshMarkers(clonedEntry, baseOffset);
-  return clonedEntry;
+  return Array.from(overridesByBundlePath.values());
 }
 
 function offsetMeshMarkers(entry, baseOffset, markerTransform) {
@@ -3919,17 +3860,16 @@ function serializeMeshBundleOverrideScript(patches) {
   const payload = patches.map((patch) => ({
     bundleJsonPath: patch.bundleJsonPath,
     bundleBlobPath: patch.bundleBlobPath,
-    jsonBase64: textToBase64(patch.jsonText),
-    blobBase64: arrayBufferToBase64(patch.blobBytes),
+    replacements: patch.replacements.map((replacement) => ({
+      meshId: replacement.meshId,
+      entry: replacement.entry,
+      blobBase64: arrayBufferToBase64(replacement.blobBytes),
+    })),
   }));
 
   return `<script data-luna-mesh-overrides>!function(){const patches=${JSON.stringify(
     payload
-  )};function base64ToBytes(value){const binary=window.atob(value);const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index+=1){bytes[index]=binary.charCodeAt(index)}return bytes}function base64ToText(value){return new TextDecoder("utf-8").decode(base64ToBytes(value))}window.jsons=window.jsons||{};window.blobs=window.blobs||{};window._compressedAssets=window._compressedAssets||[];const priorAssets=window._compressedAssets.slice();const patchPromise=Promise.all(priorAssets).then(function(){for(const patch of patches){window.jsons[patch.bundleJsonPath]=JSON.parse(base64ToText(patch.jsonBase64));window.blobs[patch.bundleBlobPath]=base64ToBytes(patch.blobBase64).buffer}});window._compressedAssets.push(patchPromise)}();</script>`;
-}
-
-function textToBase64(value) {
-  return arrayBufferToBase64(new TextEncoder().encode(value));
+  )};function base64ToBytes(value){const binary=window.atob(value);const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index+=1){bytes[index]=binary.charCodeAt(index)}return bytes}function ensureBytes(value){if(value instanceof Uint8Array)return value;if(value instanceof ArrayBuffer)return new Uint8Array(value);if(ArrayBuffer.isView(value))return new Uint8Array(value.buffer,value.byteOffset,value.byteLength);return new Uint8Array(0)}function concatBytes(parts){const buffers=parts.map(ensureBytes).filter(function(part){return part.byteLength>0});const total=buffers.reduce(function(size,part){return size+part.byteLength},0);const merged=new Uint8Array(total);let offset=0;for(const part of buffers){merged.set(part,offset);offset+=part.byteLength}return merged}function isMarker(value){return Array.isArray(value)&&2===value.length&&Number.isFinite(Number(value[0]))&&Number.isFinite(Number(value[1]))}function offsetMarker(marker,baseOffset){if(!isMarker(marker))throw new Error("A mesh blob marker is not a valid [offset, length] pair.");return[Number(marker[0])+baseOffset,Number(marker[1])]}function offsetMeshMarkers(entry,baseOffset){const data=Array.isArray(entry&&entry.data)?entry.data:null;if(!data)throw new Error("The Luna mesh entry is missing its data payload.");if(isMarker(data[6])){data[6]=offsetMarker(data[6],baseOffset)}else{throw new Error("The Luna mesh entry is missing its vertex blob marker.")}const subMeshes=Array.isArray(data[7])?data[7]:[];for(const subMesh of subMeshes){if(!Array.isArray(subMesh))continue;for(let index=0;index<subMesh.length;index+=1){if(isMarker(subMesh[index])){subMesh[index]=offsetMarker(subMesh[index],baseOffset)}}}const blendShapes=Array.isArray(data[9])?data[9]:[];for(const blendShape of blendShapes){const frames=Array.isArray(blendShape)?blendShape[1]:null;if(!Array.isArray(frames))continue;for(const frame of frames){if(!Array.isArray(frame))continue;for(let index=1;index<=3;index+=1){if(isMarker(frame[index])){frame[index]=offsetMarker(frame[index],baseOffset)}}}}}window.jsons=window.jsons||{};window.blobs=window.blobs||{};window._compressedAssets=window._compressedAssets||[];const priorAssets=window._compressedAssets.slice();const patchPromise=Promise.all(priorAssets).then(function(){for(const patch of patches){const bundleJson=window.jsons[patch.bundleJsonPath];const originalBlob=ensureBytes(window.blobs[patch.bundleBlobPath]);if(!bundleJson||!Array.isArray(bundleJson.meshes)||!originalBlob.byteLength)continue;const blobParts=[originalBlob];let appendOffset=originalBlob.byteLength;for(const replacement of patch.replacements){const meshIndex=bundleJson.meshes.findIndex(function(entry){return String((entry&&entry.id)||"")===replacement.meshId});if(meshIndex<0)continue;const targetEntry=bundleJson.meshes[meshIndex];const replacementEntry=replacement.entry;const payloadBytes=base64ToBytes(replacement.blobBase64);offsetMeshMarkers(replacementEntry,appendOffset);replacementEntry.id=targetEntry.id;replacementEntry.assetBundleId=targetEntry.assetBundleId;replacementEntry.path=targetEntry.path||replacementEntry.path;if(Array.isArray(targetEntry.data)&&Array.isArray(replacementEntry.data)&&"string"==typeof targetEntry.data[0]&&targetEntry.data[0]){replacementEntry.data[0]=targetEntry.data[0]}bundleJson.meshes[meshIndex]=replacementEntry;if(payloadBytes.byteLength){blobParts.push(payloadBytes);appendOffset+=payloadBytes.byteLength}}window.jsons[patch.bundleJsonPath]=bundleJson;window.blobs[patch.bundleBlobPath]=concatBytes(blobParts).buffer}});window._compressedAssets.push(patchPromise)}();</script>`;
 }
 
 function arrayBufferToBase64(value) {
