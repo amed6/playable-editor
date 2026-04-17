@@ -219,21 +219,44 @@ function bindEvents() {
     }
   });
 
-  elements.downloadBtn.addEventListener("click", () => {
+  elements.downloadBtn.addEventListener("click", async () => {
     if (!state.model) {
       return;
     }
 
-    const html = buildPatchedHtml();
-    const blob = new Blob([html], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = getDownloadName(state.filename);
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    elements.downloadBtn.disabled = true;
+
+    try {
+      const exportResult = await buildDownloadHtml();
+      const blob = new Blob([exportResult.html], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = getDownloadName(state.filename);
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      state.status = {
+        kind: "ready",
+        message:
+          exportResult.mode === "embedded-rebuild"
+            ? "Downloaded a compact mesh export with the original Luna mesh bundle rebuilt in-place."
+            : exportResult.mode === "runtime-patch"
+              ? `Downloaded the edited HTML with the runtime mesh patch fallback. ${exportResult.fallbackReason}`
+              : "Downloaded the edited HTML.",
+      };
+      updateStatusBanner();
+    } catch (error) {
+      state.status = {
+        kind: "error",
+        message: `Could not build the edited HTML: ${getErrorMessage(error)}`,
+      };
+      updateStatusBanner();
+    } finally {
+      renderApp();
+    }
   });
 
   elements.resetBtn.addEventListener("click", () => {
@@ -1395,6 +1418,7 @@ function createCustomObjMeshReplacementPayload(targetMesh, objModel) {
   const targetEntry = targetMesh.rawEntry;
   const targetData = Array.isArray(targetEntry?.data) ? targetEntry.data : [];
   const streams = Array.isArray(targetData[5]) ? targetData[5].slice() : [];
+  const useHalfPrecision = targetData[1] === true;
 
   if (!streams.length) {
     throw new Error("The target Luna mesh does not expose a readable stream layout.");
@@ -1409,11 +1433,16 @@ function createCustomObjMeshReplacementPayload(targetMesh, objModel) {
     throw new Error("Meshes with blend shapes are not supported for custom OBJ replacement yet.");
   }
 
-  const geometry = buildCustomObjGeometry(objModel, streams, targetMesh.subMeshCount || 1);
+  const geometry = buildCustomObjGeometry(
+    objModel,
+    streams,
+    targetMesh.subMeshCount || 1,
+    useHalfPrecision
+  );
   const customEntry = deepClone(targetEntry);
 
   customEntry.data[0] = objModel.name || customEntry.data[0] || "Custom OBJ";
-  customEntry.data[1] = false;
+  customEntry.data[1] = geometry.halfPrecision;
   customEntry.data[2] = geometry.useUInt32IndexFormat;
   customEntry.data[3] = geometry.vertexCount;
   customEntry.data[4] = geometry.aabb;
@@ -1430,7 +1459,12 @@ function createCustomObjMeshReplacementPayload(targetMesh, objModel) {
   };
 }
 
-function buildCustomObjGeometry(objModel, streams, targetSubMeshCount) {
+function buildCustomObjGeometry(
+  objModel,
+  streams,
+  targetSubMeshCount,
+  useHalfPrecision = false
+) {
   const groups = objModel.groups;
   const positions = objModel.positions;
   const texcoords = objModel.texcoords;
@@ -1484,10 +1518,10 @@ function buildCustomObjGeometry(objModel, streams, targetSubMeshCount) {
   const useUInt32IndexFormat =
     vertices.length > 65535 ||
     subMeshIndices.some((indices) => indices.some((value) => value > 65535));
-  const vertexFloats = buildVertexFloatBuffer(vertices, streams);
-  const vertexByteLength = vertexFloats.byteLength;
+  const vertexBytes = buildVertexBinaryBuffer(vertices, streams, useHalfPrecision);
+  const vertexByteLength = vertexBytes.byteLength;
   const blobParts = [];
-  blobParts.push(new Uint8Array(vertexFloats.buffer.slice(0)));
+  blobParts.push(vertexBytes);
 
   let nextOffset = vertexByteLength;
   const subMeshMarkers = [];
@@ -1514,6 +1548,7 @@ function buildCustomObjGeometry(objModel, streams, targetSubMeshCount) {
     blobBytes,
     subMeshMarkers,
     useUInt32IndexFormat,
+    halfPrecision: useHalfPrecision,
     aabb,
     summary: {
       vertexCount: vertices.length,
@@ -1523,7 +1558,7 @@ function buildCustomObjGeometry(objModel, streams, targetSubMeshCount) {
       boundsSummary: formatBounds(aabbToSummaryBounds(aabb)),
       indexRangesSummary: indexRangeStats.summary,
       channelCount: streams.length,
-      halfPrecision: false,
+      halfPrecision: useHalfPrecision,
       bindPoseCount: 0,
       blendShapeCount: 0,
       rawDataLength: 10,
@@ -1634,55 +1669,115 @@ function fitObjGroupsToTargetSubMeshes(groupIndices, targetSubMeshCount) {
   return subMeshes;
 }
 
-function buildVertexFloatBuffer(vertices, streams) {
+function buildVertexBinaryBuffer(vertices, streams, useHalfPrecision = false) {
   const stride = getLunaStreamStride(streams);
-  const floats = new Float32Array(vertices.length * stride);
-  let offset = 0;
+  const bytesPerComponent = useHalfPrecision ? 2 : 4;
+  const buffer = new ArrayBuffer(vertices.length * stride * bytesPerComponent);
+  const view = new DataView(buffer);
+  let byteOffset = 0;
+
+  const writeComponents = (components) => {
+    for (const component of components) {
+      writeVertexComponent(view, byteOffset, component, useHalfPrecision);
+      byteOffset += bytesPerComponent;
+    }
+  };
 
   for (const vertex of vertices) {
     if (streams[0]) {
-      floats.set(vertex.position, offset);
-      offset += 3;
+      writeComponents(vertex.position);
     }
     if (streams[1]) {
-      floats.set(vertex.normal || [0, 1, 0], offset);
-      offset += 3;
+      writeComponents(vertex.normal || [0, 1, 0]);
     }
     if (streams[2]) {
-      floats.set(vertex.tangent || [1, 0, 0, 1], offset);
-      offset += 4;
+      writeComponents(vertex.tangent || [1, 0, 0, 1]);
     }
     if (streams[3]) {
-      floats.set([1, 0, 0, 0], offset);
-      offset += 4;
+      writeComponents([1, 0, 0, 0]);
     }
     if (streams[4]) {
-      floats.set([0, 0, 0, 0], offset);
-      offset += 4;
+      writeComponents([0, 0, 0, 0]);
     }
     if (streams[5]) {
-      floats.set([1, 1, 1, 1], offset);
-      offset += 4;
+      writeComponents([1, 1, 1, 1]);
     }
     if (streams[6]) {
-      floats.set(vertex.uv0 || [0, 0], offset);
-      offset += 2;
+      writeComponents(vertex.uv0 || [0, 0]);
     }
     if (streams[7]) {
-      floats.set([0, 0], offset);
-      offset += 2;
+      writeComponents([0, 0]);
     }
     if (streams[8]) {
-      floats.set([0, 0], offset);
-      offset += 2;
+      writeComponents([0, 0]);
     }
     if (streams[9]) {
-      floats.set([0, 0], offset);
-      offset += 2;
+      writeComponents([0, 0]);
     }
   }
 
-  return floats;
+  return new Uint8Array(buffer);
+}
+
+function writeVertexComponent(view, byteOffset, value, useHalfPrecision) {
+  const number = Number(value);
+  if (useHalfPrecision) {
+    view.setUint16(byteOffset, float32ToFloat16Bits(number), true);
+    return;
+  }
+
+  view.setFloat32(byteOffset, number, true);
+}
+
+const float32ToFloat16Scratch = new ArrayBuffer(4);
+const float32ToFloat16View = new Float32Array(float32ToFloat16Scratch);
+const float32ToFloat16BitsView = new Uint32Array(float32ToFloat16Scratch);
+
+function float32ToFloat16Bits(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    if (Number.isNaN(number)) {
+      return 0x7e00;
+    }
+    return number < 0 ? 0xfc00 : 0x7c00;
+  }
+
+  if (number === 0) {
+    return Object.is(number, -0) ? 0x8000 : 0;
+  }
+
+  float32ToFloat16View[0] = number;
+  const bits = float32ToFloat16BitsView[0];
+  const sign = (bits >>> 16) & 0x8000;
+  const exponent = ((bits >>> 23) & 0xff) - 127;
+  const mantissa = bits & 0x7fffff;
+
+  if (exponent < -24) {
+    return sign;
+  }
+
+  if (exponent < -14) {
+    const shifted = (mantissa | 0x800000) >> (-exponent - 1);
+    return sign | ((shifted + 0x1000) >> 13);
+  }
+
+  if (exponent > 15) {
+    return sign | 0x7c00;
+  }
+
+  let halfExponent = exponent + 15;
+  let halfMantissa = (mantissa + 0x1000) >> 13;
+
+  if (halfMantissa === 0x400) {
+    halfExponent += 1;
+    halfMantissa = 0;
+  }
+
+  if (halfExponent >= 0x1f) {
+    return sign | 0x7c00;
+  }
+
+  return sign | (halfExponent << 10) | halfMantissa;
 }
 
 function getLunaStreamStride(streams) {
@@ -3318,6 +3413,7 @@ function extractCompressedBundleSpecs(html, pattern, expectedFilename) {
 
     seen.add(path);
     specs.push({
+      matchText: match[0],
       path,
       payloadLiteral: match[1],
       isBase122: parseEmbeddedCompressionFlag(match[2]),
@@ -3374,12 +3470,13 @@ async function decodeCompressedBinaryAsset(payloadLiteral, isBase122, brotliDeco
     : new Uint8Array(decodedBytes);
 }
 
+const base122IllegalCharacters = [0, 10, 13, 34, 38, 92];
+const base122ShortenedMarker = 0b111;
+
 function base122ToUint8Array(strData) {
   let curByte = 0;
   let bitOfByte = 0;
   let decodedIndex = 0;
-  const illegalCharacters = [0, 10, 13, 34, 38, 92];
-  const shortenedMarker = 0b111;
   const maxOutputLength = (1.75 * strData.length) | 0;
   const decoded = new Uint8Array(maxOutputLength);
 
@@ -3398,8 +3495,8 @@ function base122ToUint8Array(strData) {
     const code = strData.charCodeAt(index);
     if (code > 127) {
       const illegalIndex = (code >>> 8) & 7;
-      if (illegalIndex !== shortenedMarker) {
-        push7(illegalCharacters[illegalIndex]);
+      if (illegalIndex !== base122ShortenedMarker) {
+        push7(base122IllegalCharacters[illegalIndex]);
       }
       push7(code & 127);
     } else {
@@ -3885,7 +3982,325 @@ function arrayBufferToBase64(value) {
   return window.btoa(binary);
 }
 
-function buildPatchedHtml() {
+function buildRebuiltMeshBundles() {
+  const overrideEntries = Object.entries(state.meshOverrides || {});
+  if (!overrideEntries.length) {
+    return [];
+  }
+
+  const overridesByBundlePath = new Map();
+
+  for (const [meshId, override] of overrideEntries) {
+    const targetMesh = state.bundleInspection.meshesById?.[meshId];
+    const bundle = targetMesh?.bundle;
+    if (!targetMesh || !bundle) {
+      throw new Error(`Mesh ${meshId} is no longer available for replacement.`);
+    }
+    if (!bundle.rawJson || !bundle.rawBlobBytes) {
+      throw new Error(`Mesh ${meshId} belongs to a Luna bundle that was not fully decoded.`);
+    }
+    if (!override?.payload?.entry || !override?.payload?.blobBytes) {
+      throw new Error(`Mesh ${meshId} does not have a usable donor payload yet.`);
+    }
+
+    const entry = overridesByBundlePath.get(bundle.bundlePath) || {
+      bundle,
+      replacementsByMeshId: new Map(),
+    };
+    entry.replacementsByMeshId.set(meshId, {
+      entry: deepClone(override.payload.entry),
+      blobBytes: ensureUint8Array(override.payload.blobBytes),
+    });
+    overridesByBundlePath.set(bundle.bundlePath, entry);
+  }
+
+  return Array.from(overridesByBundlePath.values()).map(({ bundle, replacementsByMeshId }) => {
+    const originalMeshes = Array.isArray(bundle.rawJson?.meshes) ? bundle.rawJson.meshes : null;
+    if (!originalMeshes) {
+      throw new Error(`Luna bundle ${bundle.bundlePath} does not expose a readable mesh list.`);
+    }
+
+    const rebuiltBundleJson = deepClone(bundle.rawJson);
+    const rebuiltMeshes = [];
+    const blobParts = [];
+    let nextOffset = 0;
+
+    for (const originalMesh of originalMeshes) {
+      const meshId = String(originalMesh?.id ?? "");
+      const replacementPayload =
+        replacementsByMeshId.get(meshId) ||
+        createNormalizedMeshReplacementPayload(originalMesh, bundle.rawBlobBytes);
+      const rebuiltEntry = deepClone(replacementPayload.entry);
+      const rebuiltBytes = ensureUint8Array(replacementPayload.blobBytes);
+
+      rebuiltEntry.id = originalMesh.id;
+      rebuiltEntry.assetBundleId = originalMesh.assetBundleId;
+      rebuiltEntry.path = originalMesh.path || rebuiltEntry.path;
+
+      if (
+        Array.isArray(originalMesh.data) &&
+        Array.isArray(rebuiltEntry.data) &&
+        typeof originalMesh.data[0] === "string" &&
+        originalMesh.data[0]
+      ) {
+        rebuiltEntry.data[0] = originalMesh.data[0];
+      }
+
+      offsetMeshMarkers(rebuiltEntry, nextOffset);
+      if (rebuiltBytes.byteLength) {
+        blobParts.push(rebuiltBytes);
+        nextOffset += rebuiltBytes.byteLength;
+      }
+      rebuiltMeshes.push(rebuiltEntry);
+    }
+
+    rebuiltBundleJson.meshes = rebuiltMeshes;
+
+    return {
+      bundleJsonPath: bundle.bundlePath,
+      bundleBlobPath: bundle.dataBlobPath,
+      bundleJson: rebuiltBundleJson,
+      blobBytes: concatUint8Arrays(blobParts),
+    };
+  });
+}
+
+let bundledBrotliEncoderPromise = null;
+const safeLunaJsonBrotliOptions = {
+  quality: 3,
+  lgwin: 19,
+};
+const safeLunaBlobBrotliOptions = {
+  quality: 11,
+  lgwin: 19,
+};
+
+async function loadBundledBrotliEncoder() {
+  if (!bundledBrotliEncoderPromise) {
+    bundledBrotliEncoderPromise = import("./vendor/brotli-wasm/index.web.js")
+      .then((module) => module.default)
+      .then((encoder) => {
+        if (!encoder || typeof encoder.compress !== "function") {
+          throw new Error("The bundled Brotli encoder did not expose a compress() function.");
+        }
+        return encoder;
+      });
+  }
+
+  return bundledBrotliEncoderPromise;
+}
+
+async function brotliCompressBytes(value, options = safeLunaJsonBrotliOptions) {
+  const encoder = await loadBundledBrotliEncoder();
+  const compressedBytes = encoder.compress(
+    ensureUint8Array(value),
+    options
+  );
+  return ensureUint8Array(compressedBytes);
+}
+
+function uint8ArrayToBase122String(value) {
+  const bytes = ensureUint8Array(value);
+  let curIndex = 0;
+  let curBit = 0;
+  const utf8Bytes = [];
+
+  function get7() {
+    if (curIndex >= bytes.length) {
+      return false;
+    }
+
+    const firstByte = bytes[curIndex];
+    let firstPart = ((0b11111110 >>> curBit) & firstByte) << curBit;
+    firstPart >>= 1;
+    curBit += 7;
+
+    if (curBit < 8) {
+      return firstPart;
+    }
+
+    curBit -= 8;
+    curIndex += 1;
+    if (curIndex >= bytes.length) {
+      return firstPart;
+    }
+
+    const secondByte = bytes[curIndex];
+    let secondPart = ((0xff00 >>> curBit) & secondByte) & 0xff;
+    secondPart >>= 8 - curBit;
+    return firstPart | secondPart;
+  }
+
+  while (true) {
+    const bits = get7();
+    if (bits === false) {
+      break;
+    }
+
+    const illegalIndex = base122IllegalCharacters.indexOf(bits);
+    if (illegalIndex === -1) {
+      utf8Bytes.push(bits);
+      continue;
+    }
+
+    let nextBits = get7();
+    let firstByte = 0b11000010;
+    let secondByte = 0b10000000;
+
+    if (nextBits === false) {
+      firstByte |= (base122ShortenedMarker & 0b111) << 2;
+      nextBits = bits;
+    } else {
+      firstByte |= (illegalIndex & 0b111) << 2;
+    }
+
+    firstByte |= (nextBits & 0b01000000) ? 1 : 0;
+    secondByte |= nextBits & 0b00111111;
+    utf8Bytes.push(firstByte, secondByte);
+  }
+
+  return new TextDecoder("utf-8").decode(new Uint8Array(utf8Bytes));
+}
+
+function serializeCompactJsStringLiteral(value) {
+  let literal = '"';
+
+  for (const char of String(value)) {
+    const code = char.charCodeAt(0);
+
+    if (char === '"') {
+      literal += '\\"';
+      continue;
+    }
+    if (char === "\\") {
+      literal += "\\\\";
+      continue;
+    }
+    if (char === "<") {
+      literal += "\\x3C";
+      continue;
+    }
+    if (code === 0x2028) {
+      literal += "\\u2028";
+      continue;
+    }
+    if (code === 0x2029) {
+      literal += "\\u2029";
+      continue;
+    }
+    if (code < 0x20 || code === 0x7f) {
+      literal += `\\x${code.toString(16).padStart(2, "0").toUpperCase()}`;
+      continue;
+    }
+
+    literal += char;
+  }
+
+  literal += '"';
+  return literal;
+}
+
+async function encodeCompressedLunaAsset(value, compressionOptions) {
+  const compressedBytes = await brotliCompressBytes(value, compressionOptions);
+  const base122 = uint8ArrayToBase122String(compressedBytes);
+  const base64 = arrayBufferToBase64(compressedBytes);
+  const base122Literal = serializeCompactJsStringLiteral(base122);
+  const base64Literal = JSON.stringify(base64);
+
+  if (base122Literal.length <= base64Literal.length) {
+    return {
+      isBase122: true,
+      payloadLiteral: base122Literal,
+    };
+  }
+
+  return {
+    isBase122: false,
+    payloadLiteral: base64Literal,
+  };
+}
+
+function buildCompressedBundleJsonLoader(path, payloadLiteral, isBase122) {
+  const pathLiteral = JSON.stringify(path);
+  return `decompressString(${payloadLiteral}, ${isBase122 ? "true" : "false"}).then(function(bundleJsonText){ window.jsons[${pathLiteral}] = JSON.parse(bundleJsonText); })`;
+}
+
+function buildCompressedBundleBlobLoader(path, payloadLiteral, isBase122) {
+  const pathLiteral = JSON.stringify(path);
+  return `decompressArrayBuffer(${payloadLiteral}, ${isBase122 ? "true" : "false"}).then(function(bundleBlob){ window.blobs[${pathLiteral}] = bundleBlob; })`;
+}
+
+function replaceCompressedAssetSpec(html, spec, replacement) {
+  if (!spec?.matchText || !html.includes(spec.matchText)) {
+    throw new Error(`Could not locate the embedded Luna asset block for ${spec?.path || "?"}.`);
+  }
+
+  return html.replace(spec.matchText, () => replacement);
+}
+
+async function rebuildMeshBundlesInHtml(html) {
+  const rebuiltBundles = buildRebuiltMeshBundles();
+  if (!rebuiltBundles.length) {
+    return html.replace(meshOverrideScriptPattern, "");
+  }
+
+  const bundleJsonSpecsByPath = new Map(
+    collectCompressedBundleJsonSpecs(html).map((spec) => [spec.path, spec])
+  );
+  const bundleBlobSpecsByPath = new Map(
+    collectCompressedBundleBlobSpecs(html).map((spec) => [spec.path, spec])
+  );
+  const encodedBundles = await Promise.all(
+    rebuiltBundles.map(async (bundle) => ({
+      bundleJsonPath: bundle.bundleJsonPath,
+      bundleBlobPath: bundle.bundleBlobPath,
+      encodedJson: await encodeCompressedLunaAsset(
+        new TextEncoder().encode(JSON.stringify(bundle.bundleJson)),
+        safeLunaJsonBrotliOptions
+      ),
+      encodedBlob: await encodeCompressedLunaAsset(
+        bundle.blobBytes,
+        safeLunaBlobBrotliOptions
+      ),
+    }))
+  );
+
+  let rebuiltHtml = html.replace(meshOverrideScriptPattern, "");
+
+  for (const bundle of encodedBundles) {
+    const bundleJsonSpec = bundleJsonSpecsByPath.get(bundle.bundleJsonPath);
+    const bundleBlobSpec = bundleBlobSpecsByPath.get(bundle.bundleBlobPath);
+    if (!bundleJsonSpec) {
+      throw new Error(`Could not find ${bundle.bundleJsonPath} in the export HTML.`);
+    }
+    if (!bundleBlobSpec) {
+      throw new Error(`Could not find ${bundle.bundleBlobPath} in the export HTML.`);
+    }
+
+    rebuiltHtml = replaceCompressedAssetSpec(
+      rebuiltHtml,
+      bundleJsonSpec,
+      buildCompressedBundleJsonLoader(
+        bundle.bundleJsonPath,
+        bundle.encodedJson.payloadLiteral,
+        bundle.encodedJson.isBase122
+      )
+    );
+    rebuiltHtml = replaceCompressedAssetSpec(
+      rebuiltHtml,
+      bundleBlobSpec,
+      buildCompressedBundleBlobLoader(
+        bundle.bundleBlobPath,
+        bundle.encodedBlob.payloadLiteral,
+        bundle.encodedBlob.isBase122
+      )
+    );
+  }
+
+  return rebuiltHtml;
+}
+
+function buildBasePatchedHtml() {
   if (!state.model || !state.originalHtml) {
     return "";
   }
@@ -3923,8 +4338,85 @@ function buildPatchedHtml() {
     `$1${escapeAttribute(state.model.preloader.icon)}$3`
   );
   html = patchEmbeddedAssetSources(html);
+  return html;
+}
+
+function buildPatchedHtml() {
+  let html = buildBasePatchedHtml();
+  if (!html) {
+    return "";
+  }
+
   html = injectMeshOverrideScript(html);
   return html;
+}
+
+async function buildDownloadHtml() {
+  const html = buildBasePatchedHtml();
+  if (!html) {
+    return {
+      html: "",
+      mode: "base",
+    };
+  }
+
+  if (!Object.keys(state.meshOverrides || {}).length) {
+    return {
+      html,
+      mode: "base",
+    };
+  }
+
+  try {
+    const rebuiltHtml = await rebuildMeshBundlesInHtml(html);
+    assertReasonableExportSize(rebuiltHtml, state.originalHtml);
+    return {
+      html: rebuiltHtml,
+      mode: "embedded-rebuild",
+    };
+  } catch (error) {
+    console.warn("Falling back to runtime mesh patch export.", error);
+    return {
+      html: injectMeshOverrideScript(html),
+      mode: "runtime-patch",
+      fallbackReason: describeMeshExportFallbackReason(error),
+    };
+  }
+}
+
+function describeMeshExportFallbackReason(error) {
+  const message = getErrorMessage(error);
+
+  if (message.includes('CompressionStream("brotli")')) {
+    return 'The browser did not accept `new CompressionStream("brotli")`, even though HTTP Brotli decoding may still work here.';
+  }
+  if (message.includes("bundled Brotli encoder")) {
+    return `The local Brotli WASM fallback failed: ${message}`;
+  }
+  if (message.includes("brotli_wasm_bg.wasm")) {
+    return `The local Brotli WASM asset could not be loaded: ${message}`;
+  }
+
+  return `The compact rebuild failed: ${message}`;
+}
+
+function assertReasonableExportSize(nextHtml, originalHtml) {
+  const nextLength = String(nextHtml || "").length;
+  const originalLength = String(originalHtml || "").length;
+  const absoluteLimit = 20 * 1024 * 1024;
+  const relativeLimit = originalLength > 0 ? originalLength * 4 : 0;
+
+  if (
+    nextLength > absoluteLimit &&
+    relativeLimit > 0 &&
+    nextLength > relativeLimit
+  ) {
+    throw new Error(
+      `Compact rebuild produced an unexpectedly large HTML export (${formatBytes(
+        nextLength
+      )} vs ${formatBytes(originalLength)} original).`
+    );
+  }
 }
 
 function buildPreviewHtml(baseHtml) {
